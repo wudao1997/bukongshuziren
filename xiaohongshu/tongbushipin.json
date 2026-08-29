@@ -1,0 +1,89 @@
+module.exports = {
+  async run(ctx) {
+    const cdp = ctx?.cdp;
+    const step = ctx?.step || (() => {});
+    const delay = ctx?.delay || (async () => {});
+    const throwIfCancelled = ctx?.throwIfCancelled || (() => {});
+    const waitSelector = ctx?.waitSelector;
+    const trySetFileInputFilesEx = ctx?.trySetFileInputFilesEx;
+    const evalJs0 = ctx?.evalJs0;
+    const evalJsIn = ctx?.evalJsIn;
+    const dbg = typeof ctx?.dbg === "function" ? ctx.dbg : () => {};
+    const ctxId = Number(ctx?.ctxId || 0) || 0;
+    const evalJs = (expression) => (typeof evalJsIn === "function" ? evalJsIn(expression, ctxId) : evalJs0?.(expression));
+    const videoPath = String(ctx?.data?.videoPath || "").trim();
+    const abs = videoPath ? ctx?.path?.resolve(videoPath) : "";
+    if (!videoPath) return { ok: false, message: "empty videoPath" };
+    if (!abs || !ctx?.fs?.existsSync?.(abs)) return { ok: false, message: `video not found: ${abs}` };
+    const fileSelList = [
+      "input[type='file'][accept*='video']",
+      "input[type='file'][accept*='mp4']",
+      "input[type='file']"
+    ];
+
+    throwIfCancelled();
+    step("xhs:video:set_file_try_direct");
+    let setRes = null;
+    for (const sel of fileSelList) {
+      throwIfCancelled();
+      setRes = await trySetFileInputFilesEx?.(abs, "video", sel);
+      if (setRes && setRes.ok === true) break;
+    }
+    if (!setRes || setRes.ok !== true) {
+      dbg("H2", "xhs.video.direct_set_failed", { message: String(setRes?.message || "") });
+      throwIfCancelled();
+      step("xhs:video:click_upload_by_text");
+      await evalJs?.(
+        `(async () => {
+  const textOf = (n) => String(n?.innerText || n?.textContent || "").replace(/\\s+/g, "");
+  const nodes = Array.from(document.querySelectorAll("button,[role=button],div"));
+  const hit = nodes.find((n) => textOf(n).includes("上传视频") || textOf(n).includes("点击上传"));
+  if (!hit) return { ok: false, message: "no upload text node" };
+  const btn = hit.closest("button,[role=button],label,div") || hit;
+  try { btn.scrollIntoView({ block: "center", inline: "center" }); } catch {}
+  try { btn.click(); } catch {}
+  return { ok: true };
+})()`
+      );
+      await delay(350);
+      throwIfCancelled();
+      step("xhs:video:set_file_after_click");
+      for (const sel of fileSelList) {
+        throwIfCancelled();
+        setRes = await trySetFileInputFilesEx?.(abs, "video", sel);
+        if (setRes && setRes.ok === true) break;
+      }
+    }
+    if (!setRes || setRes.ok !== true) return { ok: false, message: String(setRes?.message || "set video file failed") };
+    throwIfCancelled();
+    step("xhs:video:wait_form_ready");
+    const start = Date.now();
+    let okForm = false;
+    while (Date.now() - start < 240000) {
+      throwIfCancelled();
+      const st = await evalJs?.(
+        `
+(() => {
+  const root = document.querySelector("#publish-container") || document.body;
+  const hasTitle =
+    !!root.querySelector("input[placeholder*='标题'],input[placeholder*='作品标题'],input[type='text'][placeholder*='标题']") ||
+    /作品标题|填写作品标题|标题/.test(String(root.innerText || root.textContent || ""));
+  const hasEditor = !!root.querySelector("[data-slate-editor='true'][contenteditable='true'],[contenteditable='true'][role='textbox']");
+  const hasProgress = /上传中|上传失败|转码|处理中|上传完成/.test(String(root.innerText || root.textContent || ""));
+  return { hasTitle, hasEditor, hasProgress };
+})()
+        `.trim()
+      );
+      if (st && (st.hasTitle || st.hasEditor || st.hasProgress)) {
+        okForm = true;
+        break;
+      }
+      const sec = Math.floor((Date.now() - start) / 5000);
+      if (sec >= 1) step(`xhs:video:waiting ${sec * 5}s`);
+      await delay(300);
+    }
+    if (!okForm) return { ok: false, message: "form not ready after upload" };
+    step("xhs:video:done");
+    return { ok: true, abs };
+  }
+};

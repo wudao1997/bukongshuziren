@@ -1,0 +1,190 @@
+// 快手发布页：同步封面 优化版 | 修复 no file inputs + 弹窗卡死 + 时序问题
+module.exports = {
+  async run(ctx) {
+    const step = ctx?.step || (() => {});
+    const throwIfCancelled = ctx?.throwIfCancelled || (() => {});
+    const waitSelector = ctx?.waitSelector;
+    const clickSelectorPoint = ctx?.clickSelectorPoint;
+    const trySetFileInputFilesEx = ctx?.trySetFileInputFilesEx;
+    const evalJs0 = ctx?.evalJs0;
+    const evalJsIn = ctx?.evalJsIn;
+    const delay = ctx?.delay || (async (ms) => new Promise(resolve => setTimeout(resolve, ms)));
+    const ctxId = Number(ctx?.ctxId || 0) || 0;
+    const evalJs = (expression) => (typeof evalJsIn === "function" ? evalJsIn(expression, ctxId) : evalJs0?.(expression));
+
+    // 读取封面路径 & 前置校验
+    const coverPath = String(ctx?.data?.coverPath || "").trim();
+    const abs = coverPath ? ctx?.path?.resolve(coverPath) : "";
+    if (!coverPath) return { ok: false, message: "empty coverPath" };
+    if (!abs || !ctx?.fs?.existsSync?.(abs)) return { ok: false, message: `cover not found: ${abs}` };
+
+    // ===================== 【优化1：精简稳定选择器（复用录制Class + 穿透兼容） =====================
+    // 封面入口（主选择器 + 备用）
+    const entrySel = "div._default-cover_ps02t_86 > div";
+    // 上传封面标签页
+    const tabSel = "div._header_2t3fe_7 div:nth-of-type(2)";
+    // 上传图片按钮
+    const uploadBtnSel = "div._cropper_1i0wh_12 button";
+    // 确认按钮
+    const confirmSel = "button.ant-btn-default > span";
+    // 核心：文件上传控件（精准限定范围，兼容穿透）
+    const fileSel = "#microSupport input[type='file']";
+    // 弹窗根容器 & 裁剪容器（用于状态检测）
+    const modalRoot = "#microSupport";
+    const cropperContainer = "div._cropper_1i0wh_12";
+
+    // 通用：根据文本点击元素（降级兜底）
+    const clickByText = async (keyword) => {
+      const r = await evalJs?.(
+        `
+(() => {
+  const key = ${JSON.stringify(String(keyword || ""))};
+  const textOf = (n) => String(n?.innerText || n?.textContent || "").replace(/\\s+/g, "");
+  const isVisible = (n) => {
+    try {
+      if (!n) return false;
+      const r = n.getBoundingClientRect ? n.getBoundingClientRect() : null;
+      if (!r) return true;
+      return (r.width || 0) > 8 && (r.height || 0) > 8;
+    } catch { return true; }
+  };
+  const node = Array.from(document.querySelectorAll("button,[role=button],div,span,a,label"))
+    .find((n) => isVisible(n) && textOf(n).includes(key)) || null;
+  if (!node) return { ok: false };
+  const btn = node.closest("button,[role=button],div,span,a,label") || node;
+  try { btn.scrollIntoView({ block: "center", inline: "center" }); } catch {}
+  try { btn.click(); } catch {}
+  return { ok: true };
+})()
+        `.trim()
+      );
+      return r?.ok === true;
+    };
+
+    // 【新增】轮询等待文件输入框 input[type="file"] 出现（解决 no file inputs 核心逻辑）
+    const waitFileInput = async (selector, maxWaitMs = 8000) => {
+      const loopTimes = Math.floor(maxWaitMs / 300);
+      for (let i = 0; i < loopTimes; i++) {
+        throwIfCancelled();
+        const exist = await evalJs(`
+          (() => {
+            const el = document.querySelector(${JSON.stringify(selector)});
+            return !!el;
+          })()
+        `);
+        if (exist) return true;
+        await delay(300);
+      }
+      return false;
+    };
+
+    throwIfCancelled();
+    step("ks:cover:open_entry 点击封面入口");
+    // 等待封面入口元素加载
+    await waitSelector?.(entrySel, 15000, ctxId).catch(() => false);
+    let opened = false;
+    if (typeof clickSelectorPoint === "function") {
+      opened = !!(await clickSelectorPoint(entrySel, 114, 60));
+    }
+    // 选择器失效则文本兜底
+    if (!opened) opened = await clickByText("默认封面");
+    if (!opened) return { ok: false, message: "封面入口点击失败" };
+    await delay(600); // 等待弹窗弹出
+
+    throwIfCancelled();
+    step("ks:cover:wait_modal 等待封面弹窗加载");
+    const modalOk = (await waitSelector?.(modalRoot, 15000, ctxId)) === true;
+    if (!modalOk) return { ok: false, message: "封面弹窗未加载" };
+    await delay(400);
+
+    throwIfCancelled();
+    step("ks:cover:tab_upload_cover 切换到【上传封面】标签");
+    let tabClicked = false;
+    if (typeof clickSelectorPoint === "function") {
+      tabClicked = !!(await clickSelectorPoint(tabSel, 48, 5));
+    }
+    if (!tabClicked) tabClicked = await clickByText("上传封面");
+    if (!tabClicked) return { ok: false, message: "上传封面标签点击失败" };
+    await delay(400); // 切换标签后等待内容渲染
+
+    throwIfCancelled();
+    step("ks:cover:click_upload_image 点击【上传图片】按钮");
+    let uploadClicked = false;
+    if (typeof clickSelectorPoint === "function") {
+      uploadClicked = !!(await clickSelectorPoint(uploadBtnSel, 123, 14));
+    }
+    if (!uploadClicked) uploadClicked = await clickByText("上传图片");
+    if (!uploadClicked) return { ok: false, message: "上传图片按钮点击失败" };
+    await delay(400);
+
+    // ===================== 【核心修复】轮询等待动态file输入框（解决 no file inputs） =====================
+    throwIfCancelled();
+    step("ks:cover:wait_file_input 等待文件上传控件生成");
+    const fileExist = await waitFileInput(fileSel, 8000);
+    if (!fileExist) return { ok: false, message: "未找到文件上传控件(file input)，no file inputs" };
+
+    throwIfCancelled();
+    step("ks:cover:set_file 绑定本地封面文件");
+    const setRes = await trySetFileInputFilesEx?.(abs, "image", fileSel);
+    if (!setRes || setRes.ok !== true) {
+      return { ok: false, message: `文件绑定失败: ${String(setRes?.message || "unknown")}`, result: setRes || null };
+    }
+
+    // ===================== 【新增】等待图片加载 + 裁剪组件就绪（解决弹窗卡死） =====================
+    throwIfCancelled();
+    step("ks:cover:wait_image_loaded 等待图片预览 & 裁剪组件渲染");
+    await waitSelector?.(cropperContainer, 10000, ctxId).catch(() => false);
+    await delay(1000); // 预留图片解码、预览渲染时间（关键：防止裁剪弹窗卡死）
+
+    throwIfCancelled();
+    step("ks:cover:confirm 点击【确认】按钮");
+    let confirmClicked = false;
+    if (typeof clickSelectorPoint === "function") {
+      confirmClicked = !!(await clickSelectorPoint(confirmSel, 22, 14));
+    }
+    if (!confirmClicked) confirmClicked = await clickByText("确认");
+    if (!confirmClicked) return { ok: false, message: "确认按钮点击失败" };
+    await delay(600);
+
+    // 增强弹窗关闭检测（延长轮询时间）
+    throwIfCancelled();
+    step("ks:cover:wait_modal_close 等待封面弹窗关闭");
+    let modalClosed = false;
+    for (let i = 0; i < 50; i += 1) {
+      throwIfCancelled();
+      const st = await evalJs(`
+        (() => {
+          const root = document.querySelector("#microSupport");
+          if (!root) return { closed: true };
+          const modal = root.querySelector(".ant-modal-wrap,.ant-modal");
+          if (!modal) return { closed: true };
+          // 判断弹窗是否可见
+          const visible = (() => {
+            try {
+              const r = modal.getBoundingClientRect();
+              return (r.width || 0) > 8 && (r.height || 0) > 8;
+            } catch { return true; }
+          })();
+          return { closed: !visible };
+        })()
+      `);
+      if (st?.closed) {
+        modalClosed = true;
+        break;
+      }
+      await delay(250);
+    }
+
+    if (!modalClosed) return { ok: false, message: "封面弹窗长时间未关闭，流程卡死" };
+
+    step("ks:cover:done 封面同步完成");
+    return {
+      ok: true,
+      abs,
+      confirmClicked,
+      modalClosed,
+      tabClicked,
+      uploadClicked
+    };
+  }
+};

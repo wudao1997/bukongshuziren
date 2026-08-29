@@ -1,0 +1,227 @@
+// 一键发布功能：用于“发布管理 → 一键发布”，将“网页填表”模块中的打开发布页/同步各项/发布按工作流串联执行（优先 Chrome，无则 Edge），支持严格串行与可取消延时。
+"use strict";
+
+function _norm(x) {
+  return String(x == null ? "" : x).trim();
+}
+
+function _isWin() {
+  return String(process.platform || "").toLowerCase() === "win32";
+}
+
+function _pickChromeExeCandidates() {
+  const pf = String(process.env.ProgramFiles || "C:\\Program Files");
+  const pf86 = String(process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)");
+  const lad = String(process.env.LOCALAPPDATA || "");
+  const out = [
+    `${pf}\\Google\\Chrome\\Application\\chrome.exe`,
+    `${pf86}\\Google\\Chrome\\Application\\chrome.exe`
+  ];
+  if (lad) out.push(`${lad}\\Google\\Chrome\\Application\\chrome.exe`);
+  return out;
+}
+
+function _detectChromeInstalled(fs) {
+  if (!_isWin()) return false;
+  const candidates = _pickChromeExeCandidates();
+  for (const p of candidates) {
+    try {
+      if (p && fs.existsSync(p)) return true;
+    } catch {}
+  }
+  return false;
+}
+
+function _buildSubPayload(base, action, opts) {
+  const platform = _norm(base?.platform);
+  const accountId = _norm(base?.accountId);
+  const data0 = base?.data && typeof base.data === "object" ? base.data : {};
+  const requestId = _norm(base?.requestId);
+  const sessionId = _norm(base?.sessionId);
+  const o = opts && typeof opts === "object" ? opts : {};
+  const webTest = {
+    action: _norm(action),
+    stages: o.stages && typeof o.stages === "object" ? o.stages : {},
+    fill: o.fill && typeof o.fill === "object" ? o.fill : {},
+    browserPreference: _norm(o.browserPreference),
+    requestId,
+    sessionId
+  };
+  return { platform, accountId, payload: { ...(data0 || {}), webTest } };
+}
+
+function _mergeSteps(outSteps, resSteps, prefix) {
+  const pre = _norm(prefix);
+  const arr = Array.isArray(resSteps) ? resSteps : [];
+  for (const it of arr) {
+    const msg = typeof it === "string" ? it : _norm(it?.msg);
+    if (!msg) continue;
+    outSteps.push(pre ? `${pre}${msg}` : msg);
+  }
+}
+
+function _pickBool(v) {
+  return v === true;
+}
+
+function _pickUploadOk(res) {
+  return _pickBool(res?.uploadInfo?.videoUploaded?.ok);
+}
+
+function _pickCoverOk(res) {
+  const flow = Array.isArray(res?.uploadInfo?.coverFlow) ? res.uploadInfo.coverFlow : [];
+  if (flow.includes("done")) return true;
+  return false;
+}
+
+function _isRetriableOpenError(message) {
+  const msg = _norm(message).toLowerCase();
+  if (!msg) return false;
+  return (
+    msg.includes("econnrefused") ||
+    msg.includes("websocketdebuggerurl") ||
+    msg.includes("no ws target") ||
+    msg.includes("chrome remote debugging not ready") ||
+    msg.includes("ws handshake failed") ||
+    msg.includes("cdp connect failed") ||
+    msg.includes("ws connect timeout")
+  );
+}
+
+async function runYiJianFaBu(ctx) {
+  const fs = ctx?.fs;
+  const runSyncExternal = ctx?.runSyncExternal;
+  const delay = typeof ctx?.delay === "function" ? ctx.delay : null;
+  const throwIfCancelled = typeof ctx?.throwIfCancelled === "function" ? ctx.throwIfCancelled : null;
+  const liveStep = typeof ctx?.liveStep === "function" ? ctx.liveStep : null;
+  const evt = ctx?.event || null;
+  const platform = _norm(ctx?.platform);
+  const accountId = _norm(ctx?.accountId);
+  const data = ctx?.data && typeof ctx.data === "object" ? ctx.data : {};
+  const requestId = _norm(ctx?.requestId);
+  if (!platform) return { ok: false, message: "empty platform", steps: [] };
+  if (!accountId) return { ok: false, message: "empty accountId", steps: [] };
+  if (!requestId) return { ok: false, message: "empty requestId", steps: [] };
+  if (!fs || typeof fs.existsSync !== "function") return { ok: false, message: "fs missing", steps: [] };
+  if (typeof runSyncExternal !== "function") return { ok: false, message: "runSyncExternal missing", steps: [] };
+
+  const steps = [];
+  const result = { open: null, title: null, tags: null, video: null, cover: null, schedule: null, saveperm: null, publish: null };
+  const chromeInstalled = _detectChromeInstalled(fs);
+  const browserPreference = chromeInstalled ? "chrome" : "edge";
+  const push = (m) => {
+    const msg = _norm(m);
+    if (!msg) return;
+    steps.push(msg);
+    try {
+      if (liveStep) liveStep(msg);
+    } catch {}
+  };
+  push(`一键发布：开始 requestId=${requestId}`);
+  push(`一键发布：浏览器优先级 chrome优先（检测到Chrome=${String(chromeInstalled)}，本次使用偏好=${browserPreference}）`);
+
+  const base = { platform, accountId, data, requestId, sessionId: "" };
+
+  const sleep = async (ms, label) => {
+    const t = Math.max(0, Number(ms || 0) || 0);
+    if (!t) return true;
+    if (throwIfCancelled) throwIfCancelled();
+    push(`一键发布：延时${t}ms${label ? `（${String(label)}）` : ""}`);
+    if (delay) {
+      await delay(t);
+      return true;
+    }
+    await new Promise((r) => setTimeout(r, t));
+    if (throwIfCancelled) throwIfCancelled();
+    return true;
+  };
+
+  const run = async (stageName, action, opts) => {
+    push(`一键发布：阶段开始 ${stageName}`);
+    if (throwIfCancelled) throwIfCancelled();
+    const payload = _buildSubPayload(base, action, opts);
+    const res = await runSyncExternal(evt, payload);
+    if (res && typeof res === "object") {
+      _mergeSteps(steps, res.steps, `【${stageName}】`);
+      if (res.cancelled) return { ok: false, cancelled: true, message: _norm(res.message) || "已停止执行", raw: res };
+      if (res.ok !== true) return { ok: false, message: _norm(res.message) || `${stageName}失败`, raw: res };
+      const sid = _norm(res.sessionId);
+      if (sid) base.sessionId = sid;
+      return { ok: true, raw: res };
+    }
+    return { ok: false, message: `${stageName}无响应` };
+  };
+
+  try {
+    let rOpen = await run("打开发布页", "open", { stages: { video: false, cover: false, fill: false }, browserPreference });
+    if (!rOpen.ok && _isRetriableOpenError(rOpen.message)) {
+      push(`一键发布：打开发布页失败，准备重试。原因=${_norm(rOpen.message)}`);
+      await sleep(1200, "等待浏览器调试端口与页面target稳定");
+      rOpen = await run("打开发布页(重试1)", "open", { stages: { video: false, cover: false, fill: false }, browserPreference });
+    }
+    if (!rOpen.ok && _isRetriableOpenError(rOpen.message)) {
+      push(`一键发布：打开发布页仍未成功，准备再次重试。原因=${_norm(rOpen.message)}`);
+      await sleep(1800, "等待浏览器页面target完全可连接");
+      rOpen = await run("打开发布页(重试2)", "open", { stages: { video: false, cover: false, fill: false }, browserPreference });
+    }
+    result.open = rOpen.raw || null;
+    if (!rOpen.ok) return { ok: false, cancelled: !!rOpen.cancelled, message: rOpen.message, steps, result };
+    if (!_norm(rOpen?.raw?.sessionId)) return { ok: false, message: "打开发布页失败：未建立会话", steps, result };
+    await sleep(1500, "等待页面完全稳定");
+
+    const rTitle = await run("同步标题", "title", { stages: { video: false, cover: false, fill: true }, fill: { title: true } });
+    result.title = rTitle.raw || null;
+    if (!rTitle.ok) return { ok: false, cancelled: !!rTitle.cancelled, message: rTitle.message, steps, result };
+    if (rTitle?.raw?.result?.filledTitle !== true) return { ok: false, message: "同步标题未确认生效", steps, result };
+    await sleep(800, "标题落盘");
+
+    const rTags = await run("同步话题", "tags", { stages: { video: false, cover: false, fill: true }, fill: { tags: true } });
+    result.tags = rTags.raw || null;
+    if (!rTags.ok) return { ok: false, cancelled: !!rTags.cancelled, message: rTags.message, steps, result };
+    if (rTags?.raw?.result?.filledTags !== true) return { ok: false, message: "同步话题未确认生效", steps, result };
+    await sleep(800, "话题落盘");
+
+    const rSavePerm = await run("保存权限设置", "saveperm", { stages: { video: false, cover: false, fill: true }, fill: { savePermission: true } });
+    result.saveperm = rSavePerm.raw || null;
+    if (!rSavePerm.ok) return { ok: false, cancelled: !!rSavePerm.cancelled, message: rSavePerm.message, steps, result };
+    if (rSavePerm?.raw?.result?.savePermissionOk !== true) return { ok: false, message: "保存权限设置未确认生效", steps, result };
+    await sleep(900, "权限落盘");
+
+    let rSchedule = await run("同步发布时间", "schedule", { stages: { video: false, cover: false, fill: true }, fill: { schedule: true } });
+    result.schedule = rSchedule.raw || null;
+    if (!rSchedule.ok) return { ok: false, cancelled: !!rSchedule.cancelled, message: rSchedule.message, steps, result };
+    if (rSchedule?.raw?.result?.scheduleOk !== true) {
+      push("一键发布：同步发布时间未确认生效，准备重试一次");
+      await sleep(1800, "等待发布时间控件稳定");
+      rSchedule = await run("同步发布时间(重试)", "schedule", { stages: { video: false, cover: false, fill: true }, fill: { schedule: true } });
+      result.schedule = rSchedule.raw || null;
+      if (!rSchedule.ok) return { ok: false, cancelled: !!rSchedule.cancelled, message: rSchedule.message, steps, result };
+      if (rSchedule?.raw?.result?.scheduleOk !== true) return { ok: false, message: "同步发布时间未确认生效", steps, result };
+    }
+    await sleep(900, "发布时间落盘");
+
+    const rVideo = await run("同步视频", "video", { stages: { video: true, cover: false, fill: false }, fill: {} });
+    result.video = rVideo.raw || null;
+    if (!rVideo.ok) return { ok: false, cancelled: !!rVideo.cancelled, message: rVideo.message, steps, result };
+    if (!_pickUploadOk(rVideo.raw)) return { ok: false, message: "同步视频未确认上传完成（可能超时/网速慢）", steps, result };
+    await sleep(12000, "等待视频上传后的页面稳定（慢网速保护）");
+
+    const rCover = await run("同步封面", "cover", { stages: { video: false, cover: true, fill: false }, fill: {} });
+    result.cover = rCover.raw || null;
+    if (!rCover.ok) return { ok: false, cancelled: !!rCover.cancelled, message: rCover.message, steps, result };
+    if (!_pickCoverOk(rCover.raw)) return { ok: false, message: "同步封面未确认完成（可能弹窗/上传未完成）", steps, result };
+    await sleep(15000, "等待封面上传/渲染稳定（慢网速保护）");
+
+    const rPublish = await run("发布", "publish", { stages: { video: false, cover: false, fill: false }, fill: {} });
+    result.publish = rPublish.raw || null;
+    if (!rPublish.ok) return { ok: false, cancelled: !!rPublish.cancelled, message: rPublish.message, steps, result };
+
+    push("一键发布：完成");
+    return { ok: true, steps, result };
+  } catch (e) {
+    if (String(e?.code || "") === "WEB_TEST_CANCELLED") return { ok: false, cancelled: true, message: String(e?.message || "已停止执行"), steps, result };
+    return { ok: false, message: String(e?.message || e), steps, result };
+  }
+}
+
+module.exports = { runYiJianFaBu };

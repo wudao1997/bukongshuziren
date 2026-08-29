@@ -1,0 +1,282 @@
+"use strict";
+
+function norm(v) {
+  return String(v == null ? "" : v).trim();
+}
+
+function isWin() {
+  return String(process.platform || "").toLowerCase() === "win32";
+}
+
+function pickChromeExeCandidates() {
+  const pf = String(process.env.ProgramFiles || "C:\\Program Files");
+  const pf86 = String(process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)");
+  const lad = String(process.env.LOCALAPPDATA || "");
+  const out = [
+    `${pf}\\Google\\Chrome\\Application\\chrome.exe`,
+    `${pf86}\\Google\\Chrome\\Application\\chrome.exe`
+  ];
+  if (lad) out.push(`${lad}\\Google\\Chrome\\Application\\chrome.exe`);
+  return out;
+}
+
+function detectChromeInstalled(fs) {
+  if (!isWin()) return false;
+  const list = pickChromeExeCandidates();
+  for (const p of list) {
+    try {
+      if (p && fs.existsSync(p)) return true;
+    } catch {}
+  }
+  return false;
+}
+
+function buildSubPayload(base, action, opts) {
+  const o = opts && typeof opts === "object" ? opts : {};
+  return {
+    platform: norm(base?.platform),
+    accountId: norm(base?.accountId),
+    payload: {
+      ...((base?.data && typeof base.data === "object") ? base.data : {}),
+      webTest: {
+        action: norm(action),
+        stages: o.stages && typeof o.stages === "object" ? o.stages : {},
+        fill: o.fill && typeof o.fill === "object" ? o.fill : {},
+        browserPreference: norm(o.browserPreference),
+        requestId: norm(base?.requestId),
+        sessionId: norm(base?.sessionId)
+      }
+    }
+  };
+}
+
+function mergeSteps(outSteps, resSteps, prefix) {
+  const pre = norm(prefix);
+  const arr = Array.isArray(resSteps) ? resSteps : [];
+  for (const it of arr) {
+    const msg = typeof it === "string" ? it : norm(it?.msg);
+    if (!msg) continue;
+    outSteps.push(pre ? `${pre}${msg}` : msg);
+  }
+}
+
+async function runYiJianFaBu(ctx) {
+  const fs = ctx?.fs;
+  const runSyncExternal = ctx?.runSyncExternal;
+  const delay = typeof ctx?.delay === "function" ? ctx.delay : async (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const throwIfCancelled = typeof ctx?.throwIfCancelled === "function" ? ctx.throwIfCancelled : () => {};
+  const liveStep = typeof ctx?.liveStep === "function" ? ctx.liveStep : null;
+  const evt = ctx?.event || null;
+  const platform = norm(ctx?.platform);
+  const accountId = norm(ctx?.accountId);
+  const data = ctx?.data && typeof ctx.data === "object" ? ctx.data : {};
+  const requestId = norm(ctx?.requestId);
+  const signalDelayMs = Math.max(0, Number(ctx?.signalDelayMs || 500) || 500);
+  if (!platform) return { ok: false, message: "empty platform", steps: [] };
+  if (!accountId) return { ok: false, message: "empty accountId", steps: [] };
+  if (!requestId) return { ok: false, message: "empty requestId", steps: [] };
+  if (!fs || typeof fs.existsSync !== "function") return { ok: false, message: "fs missing", steps: [] };
+  if (typeof runSyncExternal !== "function") return { ok: false, message: "runSyncExternal missing", steps: [] };
+
+  const steps = [];
+  const result = { open: null, video: null, cover: null, title: null, tags: null, schedule: null, publish: null };
+  const chromeInstalled = detectChromeInstalled(fs);
+  const browserPreference = chromeInstalled ? "chrome" : "edge";
+  const base = { platform, accountId, data, requestId, sessionId: "" };
+  const signalState = { last: "" };
+
+  const push = (m) => {
+    const msg = norm(m);
+    if (!msg) return;
+    steps.push(msg);
+    try {
+      if (liveStep) liveStep(msg);
+    } catch {}
+  };
+
+  const sleep = async (ms, label) => {
+    throwIfCancelled();
+    const t = Math.max(0, Number(ms || 0) || 0);
+    if (!t) return;
+    if (label) push(`小红书一键发布：延时${t}ms（${label}）`);
+    await delay(t);
+    throwIfCancelled();
+  };
+
+  const emitSignal = async (name, label) => {
+    const sig = norm(name);
+    await sleep(signalDelayMs, `${label || sig} 完成后等待信号`);
+    signalState.last = sig;
+    push(`小红书一键发布：信号已发出 ${sig}`);
+  };
+
+  const waitSignal = async (name) => {
+    const sig = norm(name);
+    throwIfCancelled();
+    if (signalState.last !== sig) {
+      return { ok: false, message: `未收到上一步信号：${sig}` };
+    }
+    push(`小红书一键发布：收到信号 ${sig}`);
+    return { ok: true };
+  };
+
+  const verifyStage = (stageName, res) => {
+    const raw = res?.raw || null;
+    const inner = raw?.result || null;
+    if (!raw || raw.ok !== true) return { ok: false, message: `${stageName}执行失败` };
+    if (stageName === "open") {
+      return norm(raw.sessionId) ? { ok: true } : { ok: false, message: "打开发布页未建立会话" };
+    }
+    if (stageName === "video") {
+      return inner && inner.ok === true && norm(inner.abs) ? { ok: true } : { ok: false, message: "同步视频未确认完成" };
+    }
+    if (stageName === "cover") {
+      return inner && inner.ok === true && norm(inner.abs) && inner.confirmClicked === true && norm(inner.confirmSignal) && inner.modalClosed === true
+        ? { ok: true }
+        : { ok: false, message: "同步封面未确认完成（完成按钮未生效或弹窗未关闭）" };
+    }
+    if (stageName === "title") {
+      return inner && inner.ok === true && norm(inner.value) ? { ok: true } : { ok: false, message: "同步标题未确认完成" };
+    }
+    if (stageName === "tags") {
+      return inner && inner.ok === true && Number(inner.len || 0) > 0 ? { ok: true } : { ok: false, message: "同步话题未确认完成" };
+    }
+    if (stageName === "schedule") {
+      const mode = norm(data?.publishTimeMode);
+      if (mode !== "schedule") return { ok: true };
+      return inner && inner.ok === true && norm(inner.finalInput || inner.scheduleAt || inner.normalized)
+        ? { ok: true }
+        : { ok: false, message: "同步发布时间未确认完成" };
+    }
+    if (stageName === "publish") {
+      return inner && inner.ok === true ? { ok: true } : { ok: false, message: "发布未确认触发" };
+    }
+    return { ok: true };
+  };
+
+  const runStage = async (cfg) => {
+    throwIfCancelled();
+    push(`小红书一键发布：开始 ${cfg.label}`);
+    const payload = buildSubPayload(base, cfg.action, {
+      stages: cfg.stages,
+      fill: cfg.fill,
+      browserPreference
+    });
+    const res = await runSyncExternal(evt, payload);
+    mergeSteps(steps, res?.steps, `【${cfg.label}】`);
+    if (res?.cancelled) return { ok: false, cancelled: true, message: norm(res?.message) || "已停止执行", raw: res };
+    if (!res || res.ok !== true) return { ok: false, message: norm(res?.message) || `${cfg.label}失败`, raw: res || null };
+    const sid = norm(res?.sessionId);
+    if (sid) base.sessionId = sid;
+    const verified = verifyStage(cfg.key, { raw: res });
+    if (!verified.ok) return { ok: false, message: verified.message, raw: res };
+    push(`小红书一键发布：${cfg.label}检测通过`);
+    await emitSignal(cfg.signal, cfg.label);
+    return { ok: true, raw: res };
+  };
+
+  push(`小红书一键发布：开始 requestId=${requestId}`);
+  push(`小红书一键发布：平台自动识别=${platform}`);
+  push(`小红书一键发布：浏览器偏好=${browserPreference}`);
+
+  try {
+    const openRes = await runStage({
+      key: "open",
+      action: "open",
+      label: "打开发布页",
+      signal: "open_done",
+      stages: { video: false, cover: false, fill: false },
+      fill: {}
+    });
+    result.open = openRes.raw || null;
+    if (!openRes.ok) return { ok: false, cancelled: !!openRes.cancelled, message: openRes.message, steps, result };
+
+    let ready = await waitSignal("open_done");
+    if (!ready.ok) return { ok: false, message: ready.message, steps, result };
+    const videoRes = await runStage({
+      key: "video",
+      action: "video",
+      label: "同步视频",
+      signal: "video_done",
+      stages: { video: true, cover: false, fill: false },
+      fill: {}
+    });
+    result.video = videoRes.raw || null;
+    if (!videoRes.ok) return { ok: false, cancelled: !!videoRes.cancelled, message: videoRes.message, steps, result };
+
+    ready = await waitSignal("video_done");
+    if (!ready.ok) return { ok: false, message: ready.message, steps, result };
+    const coverRes = await runStage({
+      key: "cover",
+      action: "cover",
+      label: "同步封面",
+      signal: "cover_done",
+      stages: { video: false, cover: true, fill: false },
+      fill: {}
+    });
+    result.cover = coverRes.raw || null;
+    if (!coverRes.ok) return { ok: false, cancelled: !!coverRes.cancelled, message: coverRes.message, steps, result };
+
+    ready = await waitSignal("cover_done");
+    if (!ready.ok) return { ok: false, message: ready.message, steps, result };
+    const titleRes = await runStage({
+      key: "title",
+      action: "title",
+      label: "同步标题",
+      signal: "title_done",
+      stages: { video: false, cover: false, fill: true },
+      fill: { title: true }
+    });
+    result.title = titleRes.raw || null;
+    if (!titleRes.ok) return { ok: false, cancelled: !!titleRes.cancelled, message: titleRes.message, steps, result };
+
+    ready = await waitSignal("title_done");
+    if (!ready.ok) return { ok: false, message: ready.message, steps, result };
+    const tagsRes = await runStage({
+      key: "tags",
+      action: "tags",
+      label: "同步话题",
+      signal: "tags_done",
+      stages: { video: false, cover: false, fill: true },
+      fill: { tags: true }
+    });
+    result.tags = tagsRes.raw || null;
+    if (!tagsRes.ok) return { ok: false, cancelled: !!tagsRes.cancelled, message: tagsRes.message, steps, result };
+
+    ready = await waitSignal("tags_done");
+    if (!ready.ok) return { ok: false, message: ready.message, steps, result };
+    const scheduleRes = await runStage({
+      key: "schedule",
+      action: "schedule",
+      label: "同步发布时间",
+      signal: "schedule_done",
+      stages: { video: false, cover: false, fill: true },
+      fill: { schedule: true }
+    });
+    result.schedule = scheduleRes.raw || null;
+    if (!scheduleRes.ok) return { ok: false, cancelled: !!scheduleRes.cancelled, message: scheduleRes.message, steps, result };
+
+    ready = await waitSignal("schedule_done");
+    if (!ready.ok) return { ok: false, message: ready.message, steps, result };
+    const publishRes = await runStage({
+      key: "publish",
+      action: "publish",
+      label: "发布",
+      signal: "publish_done",
+      stages: { video: false, cover: false, fill: false },
+      fill: {}
+    });
+    result.publish = publishRes.raw || null;
+    if (!publishRes.ok) return { ok: false, cancelled: !!publishRes.cancelled, message: publishRes.message, steps, result };
+
+    push("小红书一键发布：工作流完成");
+    return { ok: true, steps, result };
+  } catch (e) {
+    if (String(e?.code || "") === "WEB_TEST_CANCELLED") {
+      return { ok: false, cancelled: true, message: String(e?.message || "已停止执行"), steps, result };
+    }
+    return { ok: false, message: String(e?.message || e), steps, result };
+  }
+}
+
+module.exports = { runYiJianFaBu };

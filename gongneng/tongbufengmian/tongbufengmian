@@ -1,0 +1,195 @@
+// 同步封面功能：专用于“发布管理 → 网页填表 → 同步封面”，通过 CDP FileChooser 事件自动选择封面文件，避免系统文件选择框受用户鼠标/键盘操作干扰。
+"use strict";
+
+function _norm(x) {
+  return String(x == null ? "" : x).trim();
+}
+
+async function _dispatchClickAt(cdp, x, y) {
+  const xx = Math.max(0, Number(x || 0) || 0);
+  const yy = Math.max(0, Number(y || 0) || 0);
+  await cdp.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: xx, y: yy, button: "left", clickCount: 1 }).catch(() => null);
+  await cdp.send("Input.dispatchMouseEvent", { type: "mousePressed", x: xx, y: yy, button: "left", clickCount: 1 }).catch(() => null);
+  await cdp.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: xx, y: yy, button: "left", clickCount: 1 }).catch(() => null);
+  return true;
+}
+
+function _buildPickClickablePointJs(selectors) {
+  const sels = Array.isArray(selectors) ? selectors.map((s) => String(s || "").trim()).filter(Boolean) : [];
+  return `
+(() => {
+  const selectors = ${JSON.stringify(sels)};
+  const isVisible = (el) => {
+    try {
+      if (!el) return false;
+      const r = el.getBoundingClientRect();
+      if (!r || r.width <= 6 || r.height <= 6) return false;
+      const vh = Math.max(0, Number(window.innerHeight || 0) || 0);
+      const vw = Math.max(0, Number(window.innerWidth || 0) || 0);
+      if (!vh || !vw) return true;
+      const pad = 8;
+      const inY = r.bottom > pad && r.top < vh - pad;
+      const inX = r.right > pad && r.left < vw - pad;
+      return inY && inX;
+    } catch { return true; }
+  };
+  const pick = () => {
+    for (const sel of selectors) {
+      if (!sel) continue;
+      const el = document.querySelector(sel);
+      if (!el) continue;
+      try { if (el.scrollIntoView) el.scrollIntoView({ block: "center", inline: "nearest" }); } catch {}
+      const r = el.getBoundingClientRect();
+      const ok = isVisible(el);
+      if (!ok) continue;
+      return {
+        ok: true,
+        sel,
+        x: Math.max(1, Math.floor(r.left + r.width / 2)),
+        y: Math.max(1, Math.floor(r.top + r.height / 2)),
+        w: Math.floor(r.width),
+        h: Math.floor(r.height)
+      };
+    }
+    return { ok: false, reason: "no_selector_hit", selectors };
+  };
+  return pick();
+})()
+  `.trim();
+}
+
+let _lastCoverChooserBackendNodeId = 0;
+
+async function _setFilesByDomSelector(cdp, selector, absPath) {
+  const sel = String(selector || "").trim();
+  const abs = String(absPath || "").trim();
+  if (!sel || !abs) return { ok: false, reason: "empty_sel_or_abs" };
+  try {
+    await cdp.send("DOM.enable").catch(() => null);
+  } catch {}
+  const doc = await cdp.send("DOM.getDocument", { depth: 3, pierce: true }).catch(() => null);
+  const rootNodeId = Number(doc?.root?.nodeId || 0) || 0;
+  if (!rootNodeId) return { ok: false, reason: "no_dom_root" };
+  const q = await cdp.send("DOM.querySelector", { nodeId: rootNodeId, selector: sel }).catch(() => null);
+  const nodeId = Number(q?.nodeId || 0) || 0;
+  if (!nodeId) return { ok: false, reason: "no_node_for_selector", selector: sel };
+  const desc = await cdp.send("DOM.describeNode", { nodeId, depth: 1, pierce: true }).catch(() => null);
+  const backendNodeId = Number(desc?.node?.backendNodeId || 0) || 0;
+  try {
+    if (backendNodeId) {
+      const r1 = await cdp.send("DOM.setFileInputFiles", { backendNodeId, files: [abs] }).catch(() => null);
+      if (r1) return { ok: true, mode: "backendNodeId", backendNodeId };
+    }
+  } catch {}
+  try {
+    const r2 = await cdp.send("DOM.setFileInputFiles", { nodeId, files: [abs] }).catch(() => null);
+    if (r2) return { ok: true, mode: "nodeId", nodeId };
+  } catch {}
+  return { ok: false, reason: "setFileInputFiles_failed", selector: sel, backendNodeId, nodeId };
+}
+
+async function acceptCoverByFileChooser(opts) {
+  const cdp = opts?.cdp;
+  const evalJsIn = typeof opts?.evalJsIn === "function" ? opts.evalJsIn : null;
+  const ctxId = Number(opts?.ctxId || 0) || 0;
+  const delay = typeof opts?.delay === "function" ? opts.delay : (ms) => new Promise((r) => setTimeout(r, ms));
+  const step = typeof opts?.step === "function" ? opts.step : () => {};
+  const clickFn = typeof opts?.clickFn === "function" ? opts.clickFn : null;
+  const clickSelectors = Array.isArray(opts?.clickSelectors) ? opts.clickSelectors : null;
+  const fileInputSelector = _norm(opts?.fileInputSelector);
+  const absPath = _norm(opts?.absPath);
+  const timeoutMs = Math.max(2000, Number(opts?.timeoutMs || 0) || 15000);
+  if (!cdp || typeof cdp.send !== "function" || typeof cdp.waitForEvent !== "function") return { ok: false, message: "missing_cdp" };
+  if (!absPath) return { ok: false, message: "empty_absPath" };
+
+  try {
+    try {
+      await cdp.send("Page.bringToFront").catch(() => null);
+    } catch {}
+    try {
+      await cdp.send("Page.setInterceptFileChooserDialog", { enabled: true }).catch(() => null);
+    } catch {}
+    try {
+      await cdp.send("DOM.enable").catch(() => null);
+    } catch {}
+
+    const waitP = cdp.waitForEvent(
+      "Page.fileChooserOpened",
+      timeoutMs,
+      (params) => {
+        const bid = Number(params?.backendNodeId || 0) || 0;
+        if (!bid) return false;
+        if (bid === _lastCoverChooserBackendNodeId) return false;
+        return true;
+      }
+    );
+
+    let clicked = false;
+    try {
+      if (clickFn) {
+        const r = await Promise.resolve().then(() => clickFn());
+        clicked = r !== false;
+      } else if (evalJsIn && clickSelectors && clickSelectors.length) {
+        const point = await Promise.resolve().then(() => evalJsIn(_buildPickClickablePointJs(clickSelectors), ctxId)).catch(() => null);
+        if (point && point.ok && point.x && point.y) {
+          step(`cover:fileChooser:click sel=${String(point.sel || "")} x=${String(point.x)} y=${String(point.y)} w=${String(point.w)} h=${String(point.h)}`);
+          await _dispatchClickAt(cdp, point.x, point.y);
+          clicked = true;
+        } else {
+          step(`cover:fileChooser:click_fail reason=${String(point?.reason || "no_point")}`);
+          clicked = false;
+        }
+      }
+    } catch {}
+    if (!clicked) {
+      if (fileInputSelector) {
+        step(`cover:fileChooser:click_upload_failed try_dom_set selector=${fileInputSelector}`);
+        const r0 = await _setFilesByDomSelector(cdp, fileInputSelector, absPath).catch(() => null);
+        if (r0?.ok) return { ok: true, mode: "dom_set_files", detail: r0 };
+      }
+      return { ok: false, message: "click_upload_failed" };
+    }
+
+    let ev = null;
+    try {
+      ev = await waitP;
+    } catch (e) {
+      if (fileInputSelector) {
+        step(`cover:fileChooser:wait_timeout try_dom_set selector=${fileInputSelector}`);
+        const r0 = await _setFilesByDomSelector(cdp, fileInputSelector, absPath).catch(() => null);
+        if (r0?.ok) return { ok: true, mode: "dom_set_files", detail: r0 };
+      }
+      throw e;
+    }
+
+    const backendNodeId = Number(ev?.params?.backendNodeId || 0) || 0;
+    if (backendNodeId) _lastCoverChooserBackendNodeId = backendNodeId;
+    step(`cover:fileChooser:opened backendNodeId=${String(backendNodeId || 0)} mode=${String(ev?.params?.mode || "")}`);
+
+    let ok = false;
+    if (backendNodeId) {
+      const r1 = await cdp.send("DOM.setFileInputFiles", { backendNodeId, files: [absPath] }).catch(() => null);
+      ok = !!r1;
+      step(`cover:fileChooser:setFileInputFiles ok=${String(ok)}`);
+    }
+    if (!ok) {
+      const r2 = await cdp.send("Page.handleFileChooser", { action: "accept", files: [absPath] }).catch(() => null);
+      ok = !!r2;
+      step(`cover:fileChooser:handleFileChooser ok=${String(ok)}`);
+    }
+    if (!ok && fileInputSelector) {
+      step(`cover:fileChooser:accept_failed try_dom_set selector=${fileInputSelector}`);
+      const r0 = await _setFilesByDomSelector(cdp, fileInputSelector, absPath).catch(() => null);
+      if (r0?.ok) return { ok: true, mode: "dom_set_files", detail: r0 };
+    }
+    if (!ok) return { ok: false, message: "file_choose_accept_failed" };
+
+    step("cover:fileChooser:accepted");
+    await delay(120);
+    return { ok: true, mode: "fileChooser" };
+  } catch (e) {
+    return { ok: false, message: String(e?.message || e) };
+  }
+}
+
+module.exports = { acceptCoverByFileChooser };

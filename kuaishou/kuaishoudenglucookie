@@ -1,0 +1,176 @@
+"use strict";
+
+function norm(v) {
+  return String(v == null ? "" : v).trim();
+}
+
+function pickFirst(obj, paths) {
+  const root = obj && typeof obj === "object" ? obj : {};
+  const list = Array.isArray(paths) ? paths : [];
+  for (const p of list) {
+    try {
+      const segs = String(p || "")
+        .split(".")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      let cur = root;
+      for (const k of segs) {
+        if (!cur || typeof cur !== "object") {
+          cur = null;
+          break;
+        }
+        cur = cur[k];
+      }
+      if (cur !== undefined && cur !== null && cur !== "") return cur;
+    } catch {}
+  }
+  return null;
+}
+
+function extractKuaishouProfileFromInfoV2Json(parsed) {
+  const root = parsed && typeof parsed === "object" ? parsed : {};
+  const data = root.data && typeof root.data === "object" ? root.data : {};
+  const userName = norm(
+    pickFirst(data, [
+      "userName",
+      "nickname",
+      "name",
+      "userInfo.userName",
+      "userInfo.nickname",
+      "coreUserInfo.userName",
+      "coreUserInfo.nickname",
+      "nonCoreUserInfo.userName"
+    ])
+  );
+  const userId = norm(
+    pickFirst(data, [
+      "userId",
+      "uid",
+      "user_id",
+      "userInfo.userId",
+      "userInfo.uid",
+      "coreUserInfo.userId",
+      "coreUserInfo.uid",
+      "nonCoreUserInfo.userId"
+    ])
+  );
+  const fansCnt = Number(pickFirst(data, ["fansCnt", "fansNum", "userInfo.fansCnt", "coreUserInfo.fansCnt", "coreUserInfo.fansNum"]) || 0) || 0;
+  const followCnt = Number(
+    pickFirst(data, ["followCnt", "followNum", "userInfo.followCnt", "coreUserInfo.followCnt", "coreUserInfo.followNum"]) || 0
+  ) || 0;
+  const likeCnt = Number(pickFirst(data, ["likeCnt", "likeNum", "userInfo.likeCnt", "coreUserInfo.likeCnt", "coreUserInfo.likeNum"]) || 0) || 0;
+  const desc = norm(
+    pickFirst(data, [
+      "desc",
+      "signature",
+      "userInfo.desc",
+      "userInfo.signature",
+      "coreUserInfo.desc",
+      "coreUserInfo.signature",
+      "nonCoreUserInfo.desc"
+    ])
+  );
+  const avatarUrl = norm(
+    pickFirst(data, [
+      "avatarUrl",
+      "avatar",
+      "headUrl",
+      "userInfo.avatarUrl",
+      "userInfo.avatar",
+      "coreUserInfo.avatarUrl",
+      "coreUserInfo.avatar",
+      "coreUserInfo.headUrl",
+      "nonCoreUserInfo.avatarUrl"
+    ])
+  );
+  const resultCode = Number(root.result);
+  const resultOk = Number.isNaN(resultCode) ? true : resultCode === 1 || resultCode === 0;
+  const uidOk = /^\d{3,}$/.test(userId) && userId !== "0";
+  const nameOk = !!userName && !/登录|未登录|游客/i.test(userName);
+  return {
+    ok: resultOk && uidOk && nameOk,
+    userName,
+    userId,
+    fansCnt,
+    followCnt,
+    likeCnt,
+    desc,
+    avatarUrl
+  };
+}
+
+async function fetchKuaishouCreatorHomeInfoV2ByCdp({ cdp, timeoutMs = 12000, targetUrlPart = "/rest/cp/creator/pc/home/infoV2", urlHint = "" } = {}) {
+  if (!cdp || typeof cdp.onEvent !== "function" || typeof cdp.send !== "function") return { ok: false, message: "cdp missing" };
+  const t = Math.max(1000, Number(timeoutMs || 0) || 12000);
+  const part = norm(targetUrlPart);
+  const hint = norm(urlHint);
+  let settled = false;
+  let off = null;
+  const p = new Promise((resolve) => {
+    off = cdp.onEvent("Network.responseReceived", async (params) => {
+      if (settled) return;
+      try {
+        const url = norm(params?.response?.url || "");
+        const status = Number(params?.response?.status || 0) || 0;
+        const requestId = norm(params?.requestId || "");
+        if (part && !url.includes(part)) return;
+        if (hint && !url.startsWith(hint) && !url.includes(hint)) return;
+        if (!(status >= 200 && status < 300)) return;
+        if (!requestId) return;
+        const body = await cdp.send("Network.getResponseBody", { requestId }).catch(() => null);
+        const rawText = String(body?.body || "");
+        if (!rawText) return;
+        const parsed = JSON.parse(rawText);
+        const profile = extractKuaishouProfileFromInfoV2Json(parsed);
+        settled = true;
+        resolve({ ok: profile.ok, url, parsed, profile, statusCode: status });
+      } catch {}
+    });
+    setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      resolve({ ok: false, message: "timeout" });
+    }, t);
+  });
+  const out = await p.finally(() => {
+    try {
+      if (typeof off === "function") off();
+    } catch {}
+  });
+  return out && out.ok === true ? out : { ok: false, message: String(out?.message || "not found") };
+}
+
+function watchKuaishouCreatorHomeInfoV2ByCdp({ cdp, urlHint = "", targetUrlPart = "/rest/cp/creator/pc/home/infoV2", onHit } = {}) {
+  if (!cdp || typeof cdp.onEvent !== "function" || typeof cdp.send !== "function") return () => {};
+  const part = norm(targetUrlPart);
+  const hint = norm(urlHint);
+  const cb = typeof onHit === "function" ? onHit : null;
+  const off = cdp.onEvent("Network.responseReceived", async (params) => {
+    try {
+      const url = norm(params?.response?.url || "");
+      const status = Number(params?.response?.status || 0) || 0;
+      const requestId = norm(params?.requestId || "");
+      if (part && !url.includes(part)) return;
+      if (hint && !url.startsWith(hint) && !url.includes(hint)) return;
+      if (!(status >= 200 && status < 300)) return;
+      if (!requestId) return;
+      const body = await cdp.send("Network.getResponseBody", { requestId }).catch(() => null);
+      const rawText = String(body?.body || "");
+      if (!rawText) return;
+      const parsed = JSON.parse(rawText);
+      const profile = extractKuaishouProfileFromInfoV2Json(parsed);
+      if (cb) cb({ ok: profile.ok, url, parsed, profile, statusCode: status });
+    } catch {}
+  });
+  return () => {
+    try {
+      if (typeof off === "function") off();
+    } catch {}
+  };
+}
+
+module.exports = {
+  extractKuaishouProfileFromInfoV2Json,
+  fetchKuaishouCreatorHomeInfoV2ByCdp,
+  watchKuaishouCreatorHomeInfoV2ByCdp
+};

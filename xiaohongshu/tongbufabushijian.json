@@ -1,0 +1,159 @@
+module.exports = {
+  async run(ctx) {
+    const step = ctx?.step || (() => {});
+    const throwIfCancelled = ctx?.throwIfCancelled || (() => {});
+    const evalJs0 = ctx?.evalJs0;
+    const evalJsIn = ctx?.evalJsIn;
+    const waitSelector = ctx?.waitSelector;
+    const delay = ctx?.delay || (async () => {});
+    const dbg = typeof ctx?.dbg === "function" ? ctx.dbg : () => {};
+    const cdp = ctx?.cdp;
+    const clickSelectorPoint = ctx?.clickSelectorPoint;
+
+    // 业务参数
+    const mode = String(ctx?.data?.publishTimeMode || "").trim();
+    const scheduleAt = String(ctx?.data?.scheduleAt || "").trim();
+    if (mode !== "schedule") return { ok: true, skipped: true };
+    if (!scheduleAt) return { ok: false, message: "empty scheduleAt" };
+
+    const normalized = scheduleAt.replace(/:\d{2}$/, "");
+    const altFormat = normalized.replace(/^(\d{4})-(\d{2})-(\d{2})\s+/, "$1/$2/$3 ");
+    const ctxId = Number(ctx?.ctxIdSchedule || 0) || Number(ctx?.ctxId || 0) || 0;
+    const evalJs = (expression) => (typeof evalJsIn === "function" ? evalJsIn(expression, ctxId) : evalJs0?.(expression));
+
+    const timeReg = /^(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2})$/;
+    if (!timeReg.test(normalized)) {
+      return { ok: false, message: "scheduleAt 时间格式错误，要求：yyyy-MM-dd HH:mm" };
+    }
+
+    throwIfCancelled();
+    step("xhs:schedule:start 开始执行定时发布流程");
+
+    // 核心选择器（只保留关键的）
+    const SWITCH_WRAPPER = "div.publish-page-content-settings span > span"; // 开关点击容器
+    const DATE_CONTAINER = "div.date-picker-container"; // 日期容器（核心判断依据）
+    const DATE_INPUT_SEL = "div.date-picker-container input";
+    // 坐标
+    const SWITCH_OFFSET_X = 18.5;
+    const SWITCH_OFFSET_Y = 13.5;
+    const DATE_OFFSET_X = 113.5;
+    const DATE_OFFSET_Y = 12.5;
+
+    // ===================== 1. 滚动到开关并确保可见 =====================
+    step("xhs:schedule:scroll_to_switch 滚动到定时开关位置");
+    await waitSelector(SWITCH_WRAPPER);
+    await delay(300);
+    // 强制滚动到开关中央（无检测，直接滚）
+    await evalJs(`
+      (() => {
+        const el = document.querySelector(${JSON.stringify(SWITCH_WRAPPER)});
+        if(el && el.scrollIntoView) {
+          el.scrollIntoView({ behavior: 'instant', block: 'center' });
+        }
+      })();
+    `);
+    await delay(500); // 滚动后稳定
+    throwIfCancelled();
+
+    // ===================== 2. 点击开关（最多1次）+ 等待日期框出现 =====================
+    step("xhs:schedule:click_switch_and_wait_date 点击开关并等待日期框");
+    let dateContainerExist = await evalJs(`
+      (() => {
+        const el = document.querySelector(${JSON.stringify(DATE_CONTAINER)});
+        return el && el.getBoundingClientRect().width > 0;
+      })()
+    `);
+
+    // 如果日期框已存在（开关已打开），直接跳过点击
+    if (!dateContainerExist) {
+      dbg("H3", "日期框未出现，点击开关");
+      // 只点击1次（避免多次点击关闭）
+      const clickOk = await clickSelectorPoint(SWITCH_WRAPPER, SWITCH_OFFSET_X, SWITCH_OFFSET_Y);
+      if (!clickOk) {
+        return { ok: false, message: "定时开关点击失败" };
+      }
+      // 点击后等待日期框渲染（最多等8秒，足够小红书加载）
+      let waitCount = 0;
+      while (waitCount < 16 && !dateContainerExist) {
+        await delay(500);
+        dateContainerExist = await evalJs(`
+          (() => {
+            const el = document.querySelector(${JSON.stringify(DATE_CONTAINER)});
+            return el && el.getBoundingClientRect().width > 0;
+          })()
+        `);
+        waitCount++;
+      }
+    }
+
+    // 最终判断日期框是否出现
+    if (!dateContainerExist) {
+      return { ok: false, message: "点击开关后，日期框仍未出现（等待8秒），页面可能异常" };
+    }
+    step("xhs:schedule:date_container_ready 日期框已成功显示");
+    throwIfCancelled();
+
+    // ===================== 3. 处理日期框 =====================
+    step("xhs:schedule:handle_date_input 处理日期输入框");
+    // 滚动日期框到可视区域
+    await evalJs(`
+      (() => {
+        const el = document.querySelector(${JSON.stringify(DATE_INPUT_SEL)});
+        if(el && el.scrollIntoView) {
+          el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+      })();
+    `);
+    await delay(300);
+    throwIfCancelled();
+
+    // 点击日期输入框
+    const dateClickOk = await clickSelectorPoint(DATE_INPUT_SEL, DATE_OFFSET_X, DATE_OFFSET_Y);
+    if (!dateClickOk) {
+      return { ok: false, message: "日期输入框点击失败" };
+    }
+    await delay(600);
+    throwIfCancelled();
+
+    // Ctrl+A 全选
+    if (cdp && typeof cdp.send === "function") {
+      await cdp.send("Input.dispatchKeyEvent", { type: "keyDown", key: "Control", code: "ControlLeft", windowsVirtualKeyCode: 17 }).catch(() => null);
+      await cdp.send("Input.dispatchKeyEvent", { type: "keyDown", key: "a", code: "KeyA", windowsVirtualKeyCode: 65 }).catch(() => null);
+      await cdp.send("Input.dispatchKeyEvent", { type: "keyUp", key: "a", code: "KeyA", windowsVirtualKeyCode: 65 }).catch(() => null);
+      await cdp.send("Input.dispatchKeyEvent", { type: "keyUp", key: "Control", code: "ControlLeft", windowsVirtualKeyCode: 17 }).catch(() => null);
+    }
+    await delay(200);
+    throwIfCancelled();
+
+    // 写入时间
+    const fillResult = await evalJs?.(`
+      (() => {
+        const target1 = ${JSON.stringify(normalized)};
+        const target2 = ${JSON.stringify(altFormat)};
+        const inputSel = ${JSON.stringify(DATE_INPUT_SEL)};
+        const norm = (s) => String(s || "").replace(/\\s+/g, "");
+        const input = document.querySelector(inputSel);
+        if (!input) return { ok: false, msg: "未找到日期输入框" };
+
+        const tryList = [target1, target2];
+        let success = false;
+        let finalVal = "";
+        for (const val of tryList) {
+          const desc = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value");
+          if (desc?.set) desc.set.call(input, val); else input.value = val;
+          finalVal = val;
+          input.dispatchEvent(new Event("input", { bubbles: true, cancelable: true }));
+          input.dispatchEvent(new Event("change", { bubbles: true, cancelable: true }));
+          if (norm(input.value) === norm(val)) { success = true; break; }
+        }
+        return { ok: success, currentValue: String(input.value || "") };
+      })()
+    `.trim());
+
+    if (!fillResult || !fillResult.ok) {
+      return { ok: false, message: `时间写入失败，当前内容：${fillResult?.currentValue || ""}` };
+    }
+
+    return { ok: true, scheduleAt, normalized, finalInput: fillResult.currentValue };
+  }
+};

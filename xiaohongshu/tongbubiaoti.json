@@ -1,0 +1,70 @@
+module.exports = {
+  async run(ctx) {
+    const step = ctx?.step || (() => {});
+    const throwIfCancelled = ctx?.throwIfCancelled || (() => {});
+    const evalJs0 = ctx?.evalJs0;
+    const evalJsIn = ctx?.evalJsIn;
+    const waitSelector = ctx?.waitSelector;
+    const ctxId = Number(ctx?.ctxId || 0) || 0;
+    const evalJs = (expression) => (typeof evalJsIn === "function" ? evalJsIn(expression, ctxId) : evalJs0?.(expression));
+    const title = String(ctx?.data?.title || "").trim();
+    if (!title) return { ok: false, message: "empty title" };
+    throwIfCancelled();
+    step("xhs:title:wait_input");
+    const ok = (await waitSelector?.("#publish-container", 8000, ctxId)) === true;
+    if (!ok) return { ok: false, message: "publish container not found" };
+    throwIfCancelled();
+    step("xhs:title:set_value");
+    const r = await evalJs?.(
+      `
+(() => {
+  const val = ${JSON.stringify(title)};
+  const norm = (s) => String(s || "").replace(/\\s+/g, " ").trim();
+  const isVisible = (n) => {
+    try {
+      if (!n) return false;
+      const r = n.getBoundingClientRect ? n.getBoundingClientRect() : null;
+      if (!r) return true;
+      return (r.width || 0) > 20 && (r.height || 0) > 14;
+    } catch { return true; }
+  };
+  const roots = [document.querySelector("#publish-container"), document.body].filter(Boolean);
+  const pick = () => {
+    for (const root of roots) {
+      const list = [
+        "input[placeholder*='填写作品标题']",
+        "input[placeholder*='作品标题']",
+        "input[placeholder*='标题']",
+        "input[type='text'][placeholder*='标题']"
+      ];
+      for (const sel of list) {
+        const el = root.querySelector(sel);
+        if (el && isVisible(el) && !el.disabled) return el;
+      }
+      const any = Array.from(root.querySelectorAll("input[type='text'],input:not([type])")).find((i) => isVisible(i) && !i.disabled) || null;
+      if (any) return any;
+    }
+    return null;
+  };
+  const el = pick();
+  if (!el) return { ok: false, message: "no input" };
+  const setNative = (node, v) => {
+    const desc = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value");
+    if (desc && typeof desc.set === "function") desc.set.call(node, v);
+    else node.value = v;
+  };
+  try { el.focus(); } catch {}
+  try {
+    setNative(el, val);
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+  } catch {}
+  try { el.blur(); } catch {}
+  return { ok: true, value: norm(el.value || "") };
+})()
+      `.trim()
+    );
+    if (!r || r.ok !== true) return { ok: false, message: String(r?.message || "set title failed") };
+    return { ok: true, value: String(r?.value || "") };
+  }
+};

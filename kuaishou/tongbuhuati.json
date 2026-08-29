@@ -1,0 +1,75 @@
+// 快手发布页：同步话题。把标题 + 简介 + 前3个话题一次性写入作品描述框。
+module.exports = {
+  async run(ctx) {
+    const step = ctx?.step || (() => {});
+    const throwIfCancelled = ctx?.throwIfCancelled || (() => {});
+    const waitSelector = ctx?.waitSelector;
+    const evalJs0 = ctx?.evalJs0;
+    const evalJsIn = ctx?.evalJsIn;
+    const title = String(ctx?.data?.title || "").trim();
+    const desc = String(ctx?.data?.desc || "").trim();
+    const tags = Array.isArray(ctx?.data?.tags) ? ctx.data.tags : [];
+    const pickedTags = tags.map((x) => String(x || "").trim()).filter(Boolean).slice(0, 3);
+    const tagText = pickedTags.map((x) => (x.startsWith("#") ? x : `#${x}`)).join(" ");
+    const finalText = [title, desc, tagText].filter(Boolean).join("\n").trim();
+    if (!finalText) return { ok: false, message: "empty title/desc/tags" };
+
+    const ctxId = Number(ctx?.ctxId || 0) || 0;
+    const evalJs = (expression) => (typeof evalJsIn === "function" ? evalJsIn(expression, ctxId) : evalJs0?.(expression));
+
+    throwIfCancelled();
+    step("ks:tags:wait_editor");
+    const ok = (await waitSelector?.("#work-description-edit", 15000, ctxId)) === true;
+    if (!ok) return { ok: false, message: "editor not found" };
+
+    throwIfCancelled();
+    step("ks:tags:fill_editor");
+    const r = await evalJs?.(
+      `
+(() => {
+  const text = ${JSON.stringify(finalText)};
+  const el = document.querySelector("#work-description-edit");
+  if (!el) return { ok: false, message: "no editor" };
+  const setNative = (node, value) => {
+    try { node.focus(); } catch {}
+    try {
+      const sel = window.getSelection ? window.getSelection() : null;
+      if (sel) {
+        const range = document.createRange();
+        range.selectNodeContents(node);
+        range.collapse(false);
+        sel.removeAllRanges();
+        sel.addRange(range);
+      }
+    } catch {}
+    try {
+      document.execCommand("selectAll", false, null);
+      document.execCommand("insertText", false, text);
+    } catch {}
+    const cur0 = String(node.innerText || node.textContent || "").trim();
+    if (cur0 !== text) {
+      try { node.innerHTML = ""; } catch {}
+      try { node.textContent = text; } catch {}
+      const cur1 = String(node.innerText || node.textContent || "").trim();
+      if (cur1 !== text) {
+        try {
+          node.innerHTML = String(text).split("\\n").map((line) => line || "").join("<br>");
+        } catch {}
+      }
+    }
+    try { node.dispatchEvent(new InputEvent("input", { bubbles: true, data: text, inputType: "insertText" })); } catch {
+      try { node.dispatchEvent(new Event("input", { bubbles: true })); } catch {}
+    }
+    try { node.dispatchEvent(new Event("change", { bubbles: true })); } catch {}
+    try { node.blur(); } catch {}
+    return String(node.innerText || node.textContent || "").trim();
+  };
+  const finalValue = setNative(el, text);
+  return { ok: finalValue === text, len: finalValue.length, finalValue };
+})()
+      `.trim()
+    );
+    if (!r || r.ok !== true) return { ok: false, message: String(r?.message || "fill description failed"), result: r || null };
+    return { ok: true, len: Number(r?.len || 0) || 0, finalValue: String(r?.finalValue || ""), usedTags: pickedTags };
+  }
+};

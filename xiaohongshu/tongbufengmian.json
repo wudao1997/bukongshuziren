@@ -1,0 +1,576 @@
+module.exports = {
+  async run(ctx) {
+    const step = ctx?.step || (() => {});
+    const throwIfCancelled = ctx?.throwIfCancelled || (() => {});
+    const waitSelector = ctx?.waitSelector;
+    const tryClickBySelector = ctx?.tryClickBySelector;
+    const trySetFileInputFilesEx = ctx?.trySetFileInputFilesEx;
+    const evalJs0 = ctx?.evalJs0;
+    const evalJsIn = ctx?.evalJsIn;
+    const delay = ctx?.delay || (async () => {});
+    const dbg = typeof ctx?.dbg === "function" ? ctx.dbg : () => {};
+    const ctxId = Number(ctx?.ctxIdCover || 0) || Number(ctx?.ctxId || 0) || 0;
+    const evalJs = (expression) => (typeof evalJsIn === "function" ? evalJsIn(expression, ctxId) : evalJs0?.(expression));
+    const cdp = ctx?.cdp;
+    const dispatchClickAt = async (x, y) => {
+      const xx = Math.max(0, Number(x || 0) || 0);
+      const yy = Math.max(0, Number(y || 0) || 0);
+      if (!cdp || typeof cdp.send !== "function") return false;
+      await cdp.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: xx, y: yy, button: "left", clickCount: 1 }).catch(() => null);
+      await cdp.send("Input.dispatchMouseEvent", { type: "mousePressed", x: xx, y: yy, button: "left", clickCount: 1 }).catch(() => null);
+      await cdp.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: xx, y: yy, button: "left", clickCount: 1 }).catch(() => null);
+      return true;
+    };
+    const clickSelectorPoint = async (selector, offsetX, offsetY) => {
+      const hit = await evalJs?.(
+        `
+(() => {
+  const selector = ${JSON.stringify(String(selector || ""))};
+  const ox = ${JSON.stringify(Number(offsetX || 0) || 0)};
+  const oy = ${JSON.stringify(Number(offsetY || 0) || 0)};
+  const el = document.querySelector(selector);
+  if (!el) return { ok: false, message: "selector miss", selector };
+  const r = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+  if (!r) return { ok: false, message: "no rect", selector };
+  const x = Math.floor(r.left + Math.max(1, Math.min(Number(ox || 1), Math.max(1, r.width - 1))));
+  const y = Math.floor(r.top + Math.max(1, Math.min(Number(oy || 1), Math.max(1, r.height - 1))));
+  return { ok: true, selector, x, y, width: r.width, height: r.height };
+})()
+        `.trim()
+      );
+      dbg("H1", "xhs.cover.selector_point", { ctxId, selector, offsetX, offsetY, hit });
+      if (!hit || hit.ok !== true) return false;
+      return dispatchClickAt(hit.x, hit.y);
+    };
+    const checkCoverDialogOpened = async () => {
+      return await evalJs?.(
+        `
+(() => {
+  const isVisible = (n) => {
+    try {
+      if (!n) return false;
+      const r = n.getBoundingClientRect ? n.getBoundingClientRect() : null;
+      if (!r) return true;
+      return (r.width || 0) > 10 && (r.height || 0) > 10;
+    } catch { return true; }
+  };
+  const textOf = (n) => String(n?.innerText || n?.textContent || "").replace(/\\s+/g, "");
+  const titles = Array.from(document.querySelectorAll("div.d-text.--color-static.--color-text-h6.--size-text-h6.bold")).filter(isVisible);
+  const hasTitle = titles.some((n) => textOf(n).includes("设置封面"));
+  const suggestNodes = Array.from(document.querySelectorAll("span,div,button,a")).filter(isVisible);
+  const hasSuggestion = suggestNodes.some((n) => textOf(n).includes("获取封面建议"));
+  const hasUploadBtn = !!Array.from(document.querySelectorAll(".upload-btn")).find(isVisible);
+  const hasDialog = !!document.querySelector("[role='dialog'],.d-modal,.semi-modal,.modal,[class*='d-modal'],[class*='modal']");
+  const hasMaterials = !!document.querySelector("div.s-materials");
+  const opened = hasSuggestion || (hasTitle && hasDialog) || (hasTitle && hasUploadBtn) || (hasMaterials && hasUploadBtn);
+  return { ok: opened, opened, hasTitle, hasSuggestion, hasUploadBtn, hasDialog, hasMaterials };
+})()
+        `.trim()
+      );
+    };
+    const acceptFileChooserOnce = async (filePathAbs, clickFn, timeoutMs = 12000) => {
+      const abs = String(filePathAbs || "").trim();
+      if (!abs) return { ok: false, message: "empty abs" };
+      if (!cdp || typeof cdp.waitForEvent !== "function" || typeof cdp.send !== "function") return { ok: false, message: "cdp missing" };
+      try {
+        await cdp.send("Page.setInterceptFileChooserDialog", { enabled: true }).catch(() => null);
+        const waitP = cdp.waitForEvent("Page.fileChooserOpened", timeoutMs);
+        try { await Promise.resolve().then(() => clickFn && clickFn()); } catch {}
+        await waitP;
+        await cdp.send("Page.handleFileChooser", { action: "accept", files: [abs] }).catch(() => null);
+        return { ok: true };
+      } catch (e) {
+        return { ok: false, message: String(e?.message || e) };
+      }
+    };
+    const coverPath = String(ctx?.data?.coverPath || "").trim();
+    const abs = coverPath ? ctx?.path?.resolve(coverPath) : "";
+    if (!coverPath) return { ok: false, message: "empty coverPath" };
+    if (!abs || !ctx?.fs?.existsSync?.(abs)) return { ok: false, message: `cover not found: ${abs}` };
+
+    throwIfCancelled();
+    step("xhs:cover:open_entry");
+    let opened = null;
+    const recordingClicks = [
+      { selector: "div.cover-plugin-preview .cover .default.column", offsetX: 60, offsetY: 60, label: "new_cover_img" },
+      { selector: "div.cover-plugin-preview .cover", offsetX: 100, offsetY: 100, label: "new_cover_wrap" },
+      { selector: "div.publish-page-content-cover", offsetX: 258.5, offsetY: 11, label: "old_cover_root" }
+    ];
+    for (const item of recordingClicks) {
+      throwIfCancelled();
+      step(`xhs:cover:recording_click:${String(item.label || item.selector)}`);
+      const ok = await clickSelectorPoint(item.selector, item.offsetX, item.offsetY);
+      await delay(350);
+      opened = await checkCoverDialogOpened();
+      dbg("H1", "xhs.cover.recording_click_result", { ctxId, item, ok, opened });
+      if (opened && opened.ok === true && opened.opened === true) break;
+    }
+    for (let round = 1; round <= 4; round += 1) {
+      if (opened && opened.ok === true && opened.opened === true) break;
+      throwIfCancelled();
+      opened = await evalJs?.(
+        `
+(() => {
+  const textOf = (n) => String(n?.innerText || n?.textContent || "").replace(/\\s+/g, "");
+  const isVisible = (n) => {
+    try {
+      if (!n) return false;
+      const r = n.getBoundingClientRect ? n.getBoundingClientRect() : null;
+      if (!r) return true;
+      return (r.width || 0) > 8 && (r.height || 0) > 8;
+    } catch { return true; }
+  };
+  const clickNode = (n) => {
+    if (!n) return false;
+    const btn = n.closest("button,[role=button],label,div,span,a,svg") || n;
+    try { btn.scrollIntoView({ block: "center", inline: "center" }); } catch {}
+    try { btn.click(); return true; } catch {}
+    try {
+      const evt = new MouseEvent("click", { bubbles: true, cancelable: true, view: window });
+      btn.dispatchEvent(evt);
+      return true;
+    } catch {}
+    return false;
+  };
+  const isOpen = () => {
+    const titleSel = "div.d-text.--color-static.--color-text-h6.--size-text-h6.bold";
+    const titles = Array.from(document.querySelectorAll(titleSel)).filter(isVisible);
+    const hasTitle = titles.some((n) => textOf(n).includes("设置封面"));
+    const suggestNodes = Array.from(document.querySelectorAll("span,div,button,a")).filter(isVisible);
+    const suggestion = suggestNodes.find((n) => textOf(n).includes("获取封面建议")) || null;
+    const hasSuggestion = !!suggestion;
+    const up = document.querySelector(".upload-btn");
+    const hasUploadBtn = !!(up && isVisible(up));
+    const hasDialog = !!document.querySelector("[role='dialog'],.d-modal,.semi-modal,.modal,[class*='d-modal'],[class*='modal']");
+    const hasMaterials = !!document.querySelector("div.s-materials");
+    return { ok: hasSuggestion || (hasTitle && hasDialog) || (hasTitle && hasUploadBtn) || (hasMaterials && hasUploadBtn), hasTitle, hasSuggestion, hasUploadBtn, hasDialog, hasMaterials };
+  };
+  const already = isOpen();
+  if (already.ok) return { ok: true, opened: true, already: true, state: already };
+
+  const root = document.querySelector("#publish-container") || document.body;
+  const nodes = Array.from(root.querySelectorAll("button,[role=button],label,div,span,a")).filter(isVisible);
+  const keysStrong = ["修改封面", "更换封面"];
+  const keys = ["修改封面", "设置封面", "更换封面", "编辑封面", "封面操作", "封面"];
+  const hit =
+    nodes.find((n) => keysStrong.some((k) => textOf(n).includes(k))) ||
+    nodes.find((n) => keys.some((k) => textOf(n).includes(k))) ||
+    null;
+  if (!hit) return { ok: false, message: "no cover trigger" };
+
+  const buildScopes = (start) => {
+    const out = [];
+    let cur = start;
+    for (let i = 0; i < 7 && cur; i += 1) {
+      out.push(cur);
+      cur = cur.parentElement;
+    }
+    return out;
+  };
+
+  const scopes = buildScopes(hit);
+  let clicked = 0;
+  for (const scope of scopes) {
+    if (!scope) continue;
+    clickNode(scope);
+    clicked += 1;
+    const st0 = isOpen();
+    if (st0.ok) return { ok: true, opened: true, by: "scope", clicked, state: st0 };
+    const cand = Array.from(scope.querySelectorAll("button,[role=button],label,div,span,a,svg"))
+      .filter(isVisible)
+      .slice(0, 60);
+    for (const el of cand) {
+      clickNode(el);
+      clicked += 1;
+      const st = isOpen();
+      if (st.ok) return { ok: true, opened: true, by: "desc", clicked, state: st };
+    }
+  }
+  const stEnd = isOpen();
+  return { ok: true, opened: stEnd.ok, clicked, state: stEnd };
+})()
+        `.trim()
+      );
+      dbg("H1", "xhs.cover.open_probe", { round, ctxId, opened });
+      if (opened && opened.ok === true && opened.opened === true) break;
+      await delay(500);
+    }
+
+    if (!opened || opened.ok !== true || opened.opened !== true) {
+      throwIfCancelled();
+      step("xhs:cover:hover_preview_and_click_modify");
+      const hoverPlan = await evalJs?.(
+        `
+(() => {
+  const textOf = (n) => String(n?.innerText || n?.textContent || "");
+  const norm = (s) => String(s || "").replace(/\\s+/g, "");
+  const isVisible = (n) => {
+    try {
+      if (!n) return false;
+      const r = n.getBoundingClientRect ? n.getBoundingClientRect() : null;
+      if (!r) return true;
+      return (r.width || 0) > 10 && (r.height || 0) > 10;
+    } catch { return true; }
+  };
+  const centerOf = (el) => {
+    try {
+      const r = el.getBoundingClientRect();
+      return { x: Math.floor(r.left + r.width / 2), y: Math.floor(r.top + r.height / 2), w: r.width, h: r.height };
+    } catch { return { x: 0, y: 0, w: 0, h: 0 }; }
+  };
+  const root = document.querySelector("#publish-container") || document.body;
+  const titles = Array.from(root.querySelectorAll("*")).filter(isVisible).filter((n) => norm(textOf(n)).includes("设置封面"));
+  const title = titles.slice(-1)[0] || null;
+  const section = title ? (title.closest("section,div") || root) : root;
+  const source = Array.from(section.querySelectorAll("img,canvas,video,div,span"))
+    .filter(isVisible)
+    .map((el) => ({ el, c: centerOf(el) }))
+    .filter((it) => (it.c.w || 0) >= 80 && (it.c.h || 0) >= 80)
+    .filter((it) => {
+      const tag = String(it.el.tagName || "").toLowerCase();
+      if (tag === "img" || tag === "canvas" || tag === "video") return true;
+      const cls = String(it.el.className || "").toLowerCase();
+      const st = String(it.el.getAttribute && it.el.getAttribute("style") || "");
+      const hasMediaChild = !!it.el.querySelector && !!it.el.querySelector("img,canvas,video");
+      return cls.includes("cover")
+          || cls.includes("default")
+          || cls.includes("column")
+          || cls.includes("cover-plugin-preview")
+          || st.includes("background-image")
+          || hasMediaChild;
+    });
+  source.sort((a, b) => (b.c.w * b.c.h) - (a.c.w * a.c.h));
+  const uniq = [];
+  const seen = new Set();
+  for (const it of source) {
+    const key = String(Math.round(it.c.x / 20)) + "_" + String(Math.round(it.c.y / 20));
+    if (seen.has(key)) continue;
+    seen.add(key);
+    uniq.push({ x: it.c.x, y: it.c.y, w: it.c.w, h: it.c.h, tag: String(it.el.tagName || "").toLowerCase() });
+  }
+  if (!uniq.length) return { ok: false, message: "no cover preview found" };
+  return { ok: true, hovers: uniq.slice(0, 8), sectionHint: norm(textOf(section)).slice(0, 60) };
+})()
+        `.trim()
+      );
+      dbg("H1", "xhs.cover.hover_plan", { ctxId, hoverPlan });
+      if (hoverPlan && hoverPlan.ok === true && Array.isArray(hoverPlan.hovers) && hoverPlan.hovers.length) {
+        let modifyBtn = null;
+        for (const pt of hoverPlan.hovers) {
+          await cdp.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: Number(pt.x), y: Number(pt.y), button: "left", clickCount: 0 }).catch(() => null);
+          await delay(380);
+          modifyBtn = await evalJs?.(
+          `
+(() => {
+  const norm = (s) => String(s || "").replace(/\\s+/g, "");
+  const isVisible = (n) => {
+    try {
+      if (!n) return false;
+      const r = n.getBoundingClientRect ? n.getBoundingClientRect() : null;
+      if (!r) return true;
+      return (r.width || 0) > 6 && (r.height || 0) > 6;
+    } catch { return true; }
+  };
+  const textOf = (n) => String(n?.innerText || n?.textContent || "");
+  const centerOf = (el) => {
+    try {
+      const r = el.getBoundingClientRect();
+      return { x: Math.floor(r.left + r.width / 2), y: Math.floor(r.top + r.height / 2) };
+    } catch { return { x: 0, y: 0 }; }
+  };
+  const root = document.querySelector("#publish-container") || document.body;
+  const nodes = Array.from(root.querySelectorAll("button,[role=button],div,span,a")).filter(isVisible);
+  const hit = nodes.find((n) => norm(textOf(n)).includes("修改封面")) || null;
+  if (!hit) return { ok: false, message: "no 修改封面 after hover" };
+  const c = centerOf(hit);
+  return { ok: true, x: c.x, y: c.y };
+})()
+          `.trim()
+        );
+          dbg("H1", "xhs.cover.modify_after_hover", { ctxId, pt, modifyBtn });
+          if (modifyBtn && modifyBtn.ok === true && modifyBtn.x && modifyBtn.y) {
+            await dispatchClickAt(modifyBtn.x, modifyBtn.y);
+            await delay(500);
+            break;
+          }
+        }
+      }
+      opened = await evalJs?.(
+        `
+(() => {
+  const isVisible = (n) => {
+    try {
+      if (!n) return false;
+      const r = n.getBoundingClientRect ? n.getBoundingClientRect() : null;
+      if (!r) return true;
+      return (r.width || 0) > 10 && (r.height || 0) > 10;
+    } catch { return true; }
+  };
+  const textOf = (n) => String(n?.innerText || n?.textContent || "").replace(/\\s+/g, "");
+  const titleSel = "div.d-text.--color-static.--color-text-h6.--size-text-h6.bold";
+  const titles = Array.from(document.querySelectorAll(titleSel)).filter(isVisible);
+  const hasTitle = titles.some((n) => textOf(n).includes("设置封面"));
+  const suggestNodes = Array.from(document.querySelectorAll("span,div,button,a")).filter(isVisible);
+  const suggestion = suggestNodes.find((n) => textOf(n).includes("获取封面建议")) || null;
+  const hasSuggestion = !!suggestion;
+  const up = document.querySelector(".upload-btn");
+  const hasUploadBtn = !!(up && isVisible(up));
+  const hasDialog = !!document.querySelector("[role='dialog'],.d-modal,.semi-modal,.modal,[class*='d-modal'],[class*='modal']");
+  const hasMaterials = !!document.querySelector("div.s-materials");
+  const opened = hasSuggestion || (hasTitle && hasDialog) || (hasTitle && hasUploadBtn) || (hasMaterials && hasUploadBtn);
+  return { ok: opened, opened, hasTitle, hasSuggestion, hasUploadBtn, hasDialog, hasMaterials };
+})()
+        `.trim()
+      );
+      dbg("H1", "xhs.cover.open_after_hover", { ctxId, opened });
+    }
+    if (!opened || opened.ok !== true || opened.opened !== true) {
+      return { ok: false, message: `点击封面入口无效（已多轮尝试）`, result: opened || null };
+    }
+    throwIfCancelled();
+    step("xhs:cover:wait_modal_or_fileinput");
+    const modalState = await evalJs?.(
+      `
+(() => {
+  const isVisible = (n) => {
+    try {
+      if (!n) return false;
+      const r = n.getBoundingClientRect ? n.getBoundingClientRect() : null;
+      if (!r) return true;
+      return (r.width || 0) > 10 && (r.height || 0) > 10;
+    } catch { return true; }
+  };
+  const textOf = (n) => String(n?.innerText || n?.textContent || "").replace(/\\s+/g, "");
+  const titles = Array.from(document.querySelectorAll("div.d-text.--color-static.--color-text-h6.--size-text-h6.bold")).filter(isVisible);
+  const hasTitle = titles.some((n) => textOf(n).includes("设置封面"));
+  const suggestNodes = Array.from(document.querySelectorAll("span,div,button,a")).filter(isVisible);
+  const hasSuggestion = suggestNodes.some((n) => textOf(n).includes("获取封面建议"));
+  const up = document.querySelector(".upload-btn");
+  const hasUploadBtn = !!(up && isVisible(up));
+  const hasDialog = !!document.querySelector("[role='dialog'],.d-modal,.semi-modal,.modal,[class*='d-modal'],[class*='modal']");
+  const hasMaterials = !!document.querySelector("div.s-materials");
+  return { ok: hasSuggestion || (hasTitle && hasDialog) || (hasTitle && hasUploadBtn) || (hasMaterials && hasUploadBtn), hasTitle, hasSuggestion, hasUploadBtn, hasDialog, hasMaterials };
+})()
+      `.trim()
+    );
+    dbg("H2", "xhs.cover.modal_wait_result", { ctxId, modalState });
+    if (!modalState || modalState.ok !== true) {
+      return { ok: false, message: "未检测到封面弹窗/上传入口。小红书通常需要先完成视频上传后才能修改封面。" };
+    }
+    throwIfCancelled();
+    step("xhs:cover:set_file");
+    await evalJs?.(
+      `
+(() => {
+  const isVisible = (n) => {
+    try {
+      if (!n) return false;
+      const r = n.getBoundingClientRect ? n.getBoundingClientRect() : null;
+      if (!r) return true;
+      return (r.width || 0) > 10 && (r.height || 0) > 10;
+    } catch { return true; }
+  };
+  const up = document.querySelector(".upload-btn");
+  if (up && isVisible(up)) { try { up.click(); } catch {} }
+  return true;
+})()
+      `.trim()
+    );
+    await delay(250);
+    let setRes = await trySetFileInputFilesEx?.(
+      abs,
+      "image",
+      "[role='dialog'] input[type='file'][accept*='image'],[role='dialog'] input[type='file'],.d-modal input[type='file'][accept*='image'],.d-modal input[type='file'],[class*='modal'] input[type='file'][accept*='image'],[class*='modal'] input[type='file']"
+    );
+    dbg("H2", "xhs.cover.set_file_result", { ctxId, setRes });
+    if (!setRes || setRes.ok !== true) {
+      const m = String(setRes?.message || "");
+      if (m.includes("no file inputs") || m.includes("no inputs") || m.includes("no file")) {
+        throwIfCancelled();
+        step("xhs:cover:fileChooser_fallback");
+        const btn = await evalJs?.(
+          `
+(() => {
+  const isVisible = (n) => {
+    try {
+      if (!n) return false;
+      const r = n.getBoundingClientRect ? n.getBoundingClientRect() : null;
+      if (!r) return true;
+      return (r.width || 0) > 10 && (r.height || 0) > 10;
+    } catch { return true; }
+  };
+  const centerOf = (el) => {
+    try {
+      const r = el.getBoundingClientRect();
+      return { x: Math.floor(r.left + r.width / 2), y: Math.floor(r.top + r.height / 2) };
+    } catch { return { x: 0, y: 0 }; }
+  };
+  const scope =
+    document.querySelector("[role='dialog']") ||
+    document.querySelector(".d-modal") ||
+    document.querySelector(".semi-modal,.modal,[class*='modal']") ||
+    document.body;
+  const el = scope.querySelector(".upload-btn") || document.querySelector(".upload-btn");
+  if (!el || !isVisible(el)) return { ok: false, message: "no upload-btn" };
+  const c = centerOf(el);
+  return { ok: true, x: c.x, y: c.y };
+})()
+          `.trim()
+        );
+        dbg("H2", "xhs.cover.upload_btn_probe", { ctxId, btn });
+        if (!btn || btn.ok !== true) return { ok: false, message: `封面弹窗已打开但找不到上传按钮：${String(btn?.message || "")}`, result: setRes || null };
+        const chooserRes = await acceptFileChooserOnce(abs, async () => dispatchClickAt(btn.x, btn.y), 15000);
+        dbg("H2", "xhs.cover.filechooser_result", { ctxId, chooserRes });
+        if (!chooserRes || chooserRes.ok !== true) return { ok: false, message: String(chooserRes?.message || "file chooser failed"), result: setRes || null };
+        setRes = { ok: true, method: "fileChooser", abs };
+      } else {
+        return { ok: false, message: String(setRes?.message || "set cover file failed") };
+      }
+    }
+    throwIfCancelled();
+    step("xhs:cover:after_upload_wait");
+    await delay(1000);
+    throwIfCancelled();
+    step("xhs:cover:confirm");
+    await delay(600);
+    const clickConfirmInDialog = async () => {
+      const r = await evalJs?.(
+        `
+(() => {
+  const textOf = (n) => String(n?.innerText || n?.textContent || "").replace(/\\s+/g, "");
+  const isVisible = (n) => {
+    try {
+      if (!n) return false;
+      const r = n.getBoundingClientRect ? n.getBoundingClientRect() : null;
+      if (!r) return true;
+      return (r.width || 0) > 10 && (r.height || 0) > 10;
+    } catch { return true; }
+  };
+  const isDisabled = (el) => {
+    if (!el) return true;
+    const btn = el.closest("button,[role=button],label,div,span") || el;
+    try {
+      if (btn.disabled === true) return true;
+    } catch {}
+    try {
+      const aria = String(btn.getAttribute("aria-disabled") || "").toLowerCase();
+      if (aria === "true") return true;
+    } catch {}
+    try {
+      if (btn.getAttribute("disabled") != null) return true;
+    } catch {}
+    const cls = String(btn.className || "").toLowerCase();
+    if (cls.includes("disabled") || cls.includes("is-disabled") || cls.includes("btn-disabled")) return true;
+    try {
+      const st = window.getComputedStyle ? getComputedStyle(btn) : null;
+      if (st) {
+        const pe = String(st.pointerEvents || "");
+        if (pe === "none") return true;
+        const op = Number(st.opacity);
+        if (Number.isFinite(op) && op <= 0.35) return true;
+      }
+    } catch {}
+    return false;
+  };
+  const clickNode = (n) => {
+    if (!n) return false;
+    const btn = n.closest("button,[role=button],label,div,span") || n;
+    if (isDisabled(btn)) return false;
+    try { btn.scrollIntoView({ block: "center", inline: "center" }); } catch {}
+    try { btn.click(); return true; } catch {}
+    return false;
+  };
+  const dialogs = Array.from(document.querySelectorAll("[role='dialog'],.d-modal,.semi-modal,.modal,[class*='d-modal'],[class*='modal']")).filter(isVisible);
+  const pick = dialogs.find((d) => {
+    const t = textOf(d);
+    return t.includes("封面") || t.includes("裁剪") || t.includes("预览") || t.includes("保存");
+  }) || null;
+  const scope = pick || document.body;
+  const scopeText = textOf(scope);
+  if (scopeText.includes("视频加载中")) return { ok: false, message: "video_loading" };
+  const btns = Array.from(scope.querySelectorAll("button,[role=button]")).filter(isVisible);
+  const cand =
+    btns.find((b) => {
+      const t = textOf(b);
+      return t === "确定" || t === "确认" || t === "完成" || t === "保存" || t === "使用";
+    }) ||
+    btns.find((b) => /bg-red/i.test(String(b.className || ""))) ||
+    btns.find((b) => /mojito-button/i.test(String(b.className || ""))) ||
+    null;
+  if (!cand) return { ok: false, message: "no confirm button" };
+  const disabled = isDisabled(cand);
+  const clicked = disabled ? false : clickNode(cand);
+  return { ok: clicked, disabled, text: textOf(cand), cls: String(cand.className || "") };
+})()
+        `.trim()
+      );
+      return r || null;
+    };
+
+    let clicked = null;
+    let last = null;
+    for (let i = 0; i < 16; i += 1) {
+      throwIfCancelled();
+      last = await clickConfirmInDialog();
+      if (last && last.ok === true) {
+        clicked = last;
+        break;
+      }
+      await delay(500);
+    }
+    if (!clicked) return { ok: false, message: `confirm not clickable: ${String(last?.message || "")}`, result: last || null };
+
+    step(`xhs:cover:confirm_clicked text=${String(clicked?.text || "")}`);
+    const waitApplied = async () => {
+      for (let i = 0; i < 30; i += 1) {
+        throwIfCancelled();
+        const st = await evalJs?.(
+          `
+(() => {
+  const textOf = (n) => String(n?.innerText || n?.textContent || "").replace(/\\s+/g, "");
+  const isVisible = (n) => {
+    try {
+      if (!n) return false;
+      const r = n.getBoundingClientRect ? n.getBoundingClientRect() : null;
+      if (!r) return true;
+      return (r.width || 0) > 10 && (r.height || 0) > 10;
+    } catch { return true; }
+  };
+  const dialogs = Array.from(document.querySelectorAll("body [role='dialog'],body .d-modal-mask,body .d-modal,body [class*='modal'],body [class*='d-modal']")).filter(isVisible);
+  const hasModal = dialogs.length > 0;
+  const scope = dialogs[0] || document.body;
+  const hasConfirmBtn = Array.from(scope.querySelectorAll("button,[role=button],span,div"))
+    .filter(isVisible)
+    .some((n) => {
+      const t = textOf(n);
+      return t === "确定" || t === "确认" || t === "完成" || t === "保存" || t === "使用";
+    });
+  const root = document.querySelector("#publish-container") || document.body;
+  const imgCount = root.querySelectorAll("img,canvas,[style*='background-image']").length;
+  return { hasModal, hasConfirmBtn, imgCount };
+})()
+          `.trim()
+        );
+        if (st && st.hasModal === false) {
+          return { ok: true, signal: "cover_confirmed", modalClosed: true, st };
+        }
+        await delay(500);
+      }
+      return { ok: false, signal: "", modalClosed: false };
+    };
+    const applied = await waitApplied();
+    dbg("H1", "xhs.cover.applied_result", { ctxId, applied });
+    step(`xhs:cover:applied=${String(!!applied?.ok)} signal=${String(applied?.signal || "")}`);
+    if (!applied?.ok) return { ok: false, message: "封面已选择，但未检测到完成按钮生效（封面弹窗仍未关闭）" };
+    step("xhs:cover:done");
+    return {
+      ok: true,
+      abs,
+      confirmText: String(clicked?.text || ""),
+      confirmClicked: true,
+      confirmSignal: String(applied?.signal || ""),
+      modalClosed: applied?.modalClosed === true,
+      applied: applied?.ok === true
+    };
+  }
+};

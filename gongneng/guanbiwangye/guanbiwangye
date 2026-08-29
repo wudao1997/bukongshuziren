@@ -1,0 +1,322 @@
+// 关闭网页功能：用于发布管理 → 网页填表 → 关闭网页。会自动接受“离开此网站”弹窗并关闭所有已打开的发布页。
+"use strict";
+
+const http = require("http");
+const net = require("net");
+const crypto = require("crypto");
+
+function parseTargetIdFromWsUrl(wsUrl) {
+  try {
+    const u = new URL(String(wsUrl || "").trim());
+    const path = String(u.pathname || "");
+    const parts = path.split("/").filter(Boolean);
+    const last = parts[parts.length - 1] || "";
+    return String(last || "").trim();
+  } catch {
+    return "";
+  }
+}
+
+function httpGetRaw(url, timeoutMs = 2500) {
+  return new Promise((resolve) => {
+    try {
+      const u = new URL(String(url || "").trim());
+      const req = http.request(
+        {
+          protocol: u.protocol,
+          hostname: u.hostname,
+          port: Number(u.port || 80) || 80,
+          path: (u.pathname || "/") + (u.search || ""),
+          method: "GET",
+          headers: { "User-Agent": "ipfactory" }
+        },
+        (res) => {
+          const chunks = [];
+          res.on("data", (d) => chunks.push(Buffer.isBuffer(d) ? d : Buffer.from(String(d))));
+          res.on("end", () => {
+            const buf = Buffer.concat(chunks);
+            resolve({ ok: true, statusCode: Number(res.statusCode || 0) || 0, raw: buf.toString("utf-8") });
+          });
+        }
+      );
+      req.on("error", () => resolve({ ok: false, statusCode: 0, raw: "" }));
+      req.setTimeout(Math.max(200, Number(timeoutMs || 0) || 2500), () => {
+        try {
+          req.destroy();
+        } catch {}
+        resolve({ ok: false, statusCode: 0, raw: "" });
+      });
+      req.end();
+    } catch {
+      resolve({ ok: false, statusCode: 0, raw: "" });
+    }
+  });
+}
+
+function parseWsUrl(wsUrl) {
+  const u = new URL(String(wsUrl || ""));
+  const host = u.hostname || "127.0.0.1";
+  const port = Number(u.port || 80) || 80;
+  const pathAndQuery = (u.pathname || "/") + (u.search || "");
+  return { host, port, pathAndQuery };
+}
+
+function wsConnect(wsUrl, timeoutMs = 8000) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const { host, port, pathAndQuery } = parseWsUrl(wsUrl);
+    const socket = net.createConnection({ host, port });
+    const key = crypto.randomBytes(16).toString("base64");
+    let headerBuf = Buffer.alloc(0);
+    let handshakeDone = false;
+    let dataBuf = Buffer.alloc(0);
+    const onMessageCbs = new Set();
+    const pendingSend = [];
+
+    const cleanup = () => {
+      try { socket.removeAllListeners(); } catch {}
+    };
+    const fail = (err) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      try { socket.destroy(); } catch {}
+      reject(err instanceof Error ? err : new Error(String(err || "ws connect error")));
+    };
+
+    const sendFrame = (payloadBuf) => {
+      const payloadLen = payloadBuf.length;
+      const maskKey = crypto.randomBytes(4);
+      const masked = Buffer.alloc(payloadLen);
+      for (let i = 0; i < payloadLen; i += 1) masked[i] = payloadBuf[i] ^ maskKey[i % 4];
+      let header = null;
+      if (payloadLen < 126) {
+        header = Buffer.alloc(2);
+        header[0] = 0x81;
+        header[1] = 0x80 | payloadLen;
+      } else if (payloadLen < 65536) {
+        header = Buffer.alloc(4);
+        header[0] = 0x81;
+        header[1] = 0x80 | 126;
+        header.writeUInt16BE(payloadLen, 2);
+      } else {
+        header = Buffer.alloc(10);
+        header[0] = 0x81;
+        header[1] = 0x80 | 127;
+        header.writeBigUInt64BE(BigInt(payloadLen), 2);
+      }
+      const frame = Buffer.concat([header, maskKey, masked]);
+      socket.write(frame);
+    };
+
+    const tryFlush = () => {
+      while (pendingSend.length) {
+        const buf = pendingSend.shift();
+        sendFrame(buf);
+      }
+    };
+
+    const decodeFrames = () => {
+      while (dataBuf.length >= 2) {
+        const b0 = dataBuf[0];
+        const b1 = dataBuf[1];
+        const fin = (b0 & 0x80) !== 0;
+        const opcode = b0 & 0x0f;
+        const masked = (b1 & 0x80) !== 0;
+        let len = b1 & 0x7f;
+        let off = 2;
+        if (len === 126) {
+          if (dataBuf.length < off + 2) return;
+          len = dataBuf.readUInt16BE(off);
+          off += 2;
+        } else if (len === 127) {
+          if (dataBuf.length < off + 8) return;
+          len = Number(dataBuf.readBigUInt64BE(off));
+          off += 8;
+        }
+        const maskOff = masked ? 4 : 0;
+        if (dataBuf.length < off + maskOff + len) return;
+        let payload = dataBuf.subarray(off + maskOff, off + maskOff + len);
+        if (masked) {
+          const mk = dataBuf.subarray(off, off + 4);
+          const un = Buffer.alloc(len);
+          for (let i = 0; i < len; i += 1) un[i] = payload[i] ^ mk[i % 4];
+          payload = un;
+        }
+        dataBuf = dataBuf.subarray(off + maskOff + len);
+        if (opcode === 0x8) {
+          try { socket.end(); } catch {}
+          return;
+        }
+        if (opcode === 0x9) {
+          const pong = Buffer.from([0x8a, payload.length]);
+          socket.write(Buffer.concat([pong, payload]));
+          continue;
+        }
+        if (opcode !== 0x1) continue;
+        if (!fin) continue;
+        const text = payload.toString("utf-8");
+        onMessageCbs.forEach((cb) => {
+          try { cb(text); } catch {}
+        });
+      }
+    };
+
+    const timer = setTimeout(() => fail(new Error("ws connect timeout")), Math.max(200, Number(timeoutMs || 0) || 8000));
+
+    socket.on("connect", () => {
+      const req =
+        `GET ${pathAndQuery} HTTP/1.1\r\n` +
+        `Host: ${host}:${port}\r\n` +
+        "Upgrade: websocket\r\n" +
+        "Connection: Upgrade\r\n" +
+        `Sec-WebSocket-Key: ${key}\r\n` +
+        "Sec-WebSocket-Version: 13\r\n" +
+        "\r\n";
+      socket.write(req);
+    });
+    socket.on("error", fail);
+    socket.on("close", () => {
+      if (!settled && !handshakeDone) fail(new Error("ws closed"));
+    });
+    socket.on("data", (chunk) => {
+      if (!handshakeDone) {
+        headerBuf = Buffer.concat([headerBuf, chunk]);
+        const idx = headerBuf.indexOf("\r\n\r\n");
+        if (idx === -1) return;
+        const head = headerBuf.subarray(0, idx + 4).toString("utf-8");
+        const rest = headerBuf.subarray(idx + 4);
+        if (!/^HTTP\/1\.1 101/i.test(head)) return fail(new Error("ws handshake failed"));
+        handshakeDone = true;
+        clearTimeout(timer);
+        dataBuf = Buffer.concat([dataBuf, rest]);
+        decodeFrames();
+        tryFlush();
+        if (!settled) {
+          settled = true;
+          resolve({
+            sendText: (text) => {
+              const buf = Buffer.from(String(text || ""), "utf-8");
+              if (!handshakeDone) pendingSend.push(buf);
+              else sendFrame(buf);
+            },
+            onMessage: (cb) => {
+              if (typeof cb !== "function") return () => {};
+              onMessageCbs.add(cb);
+              return () => onMessageCbs.delete(cb);
+            },
+            close: () => {
+              try { socket.end(Buffer.from([0x88, 0x00])); } catch {}
+            }
+          });
+        }
+        return;
+      }
+      dataBuf = Buffer.concat([dataBuf, chunk]);
+      decodeFrames();
+    });
+  });
+}
+
+async function createCdp(wsUrl) {
+  const ws = await wsConnect(wsUrl, 8000);
+  let idSeq = 1;
+  const waits = new Map();
+  const eventListeners = new Map();
+  const off = ws.onMessage((text) => {
+    try {
+      const msg = JSON.parse(String(text || "{}"));
+      const id = Number(msg?.id || 0) || 0;
+      if (id && waits.has(id)) {
+        const { resolve, reject } = waits.get(id);
+        waits.delete(id);
+        if (msg?.error) reject(new Error(String(msg?.error?.message || "cdp error")));
+        else resolve(msg?.result);
+        return;
+      }
+      const method = String(msg?.method || "").trim();
+      if (!method) return;
+      const params = msg?.params;
+      const set = eventListeners.get(method);
+      if (set && set.size) {
+        set.forEach((cb) => {
+          try { cb(params); } catch {}
+        });
+      }
+    } catch {}
+  });
+  const send = (method, params) =>
+    new Promise((resolve, reject) => {
+      const id = idSeq++;
+      waits.set(id, { resolve, reject });
+      ws.sendText(JSON.stringify({ id, method, params: params || {} }));
+    });
+  const onEvent = (method, cb) => {
+    const m = String(method || "").trim();
+    if (!m || typeof cb !== "function") return () => {};
+    const set = eventListeners.get(m) || new Set();
+    set.add(cb);
+    eventListeners.set(m, set);
+    return () => {
+      try {
+        const s = eventListeners.get(m);
+        if (s) s.delete(cb);
+      } catch {}
+    };
+  };
+  const close = () => {
+    try {
+      eventListeners.clear();
+      off();
+    } catch {}
+    try { ws.close(); } catch {}
+  };
+  return { send, onEvent, close };
+}
+
+async function closeAllExternalWebPages(sessions) {
+  const list = Array.isArray(sessions) ? sessions : [];
+  let closed = 0;
+  const failed = [];
+  for (const s of list) {
+    const port = Number(s?.port || 0) || 0;
+    const wsUrl = String(s?.wsUrl || "").trim();
+    const sessionId = String(s?.sessionId || "").trim();
+    const targetId = parseTargetIdFromWsUrl(wsUrl);
+    if (!port || !targetId) {
+      failed.push({ sessionId, port, wsUrl, targetId, reason: "invalid_session" });
+      continue;
+    }
+    let acceptedDialog = false;
+    try {
+      if (wsUrl) {
+        const cdp = await createCdp(wsUrl);
+        try {
+          await cdp.send("Page.enable").catch(() => null);
+          const offDlg = cdp.onEvent("Page.javascriptDialogOpening", async () => {
+            acceptedDialog = true;
+            try { await cdp.send("Page.handleJavaScriptDialog", { accept: true }); } catch {}
+          });
+          await cdp.send("Runtime.enable").catch(() => null);
+          await cdp
+            .send("Runtime.evaluate", { expression: "try{window.onbeforeunload=null;}catch(e){};true", awaitPromise: true, returnByValue: true })
+            .catch(() => null);
+          await cdp.send("Page.close").catch(() => null);
+          await new Promise((r) => setTimeout(r, 420));
+          try { offDlg(); } catch {}
+        } finally {
+          try { cdp.close(); } catch {}
+        }
+      }
+    } catch {}
+    const closeUrl = `http://127.0.0.1:${port}/json/close/${encodeURIComponent(targetId)}`;
+    const r = await httpGetRaw(closeUrl, 2500);
+    if (r?.ok && r.statusCode >= 200 && r.statusCode < 400) closed += 1;
+    else failed.push({ sessionId, port, wsUrl, targetId, reason: "close_failed", acceptedDialog, statusCode: r?.statusCode || 0 });
+  }
+  return { ok: true, closed, failed };
+}
+
+module.exports = {
+  closeAllExternalWebPages
+};

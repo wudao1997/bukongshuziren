@@ -1,0 +1,161 @@
+// 快手发布页：同步视频。点击“上传视频”后，自动把发布管理里选中的视频文件写入文件输入框。
+module.exports = {
+  async run(ctx) {
+    const step = ctx?.step || (() => {});
+    const throwIfCancelled = ctx?.throwIfCancelled || (() => {});
+    const waitSelector = ctx?.waitSelector;
+    const trySetFileInputFilesEx = ctx?.trySetFileInputFilesEx;
+    const clickSelectorPoint = ctx?.clickSelectorPoint;
+    const delay = ctx?.delay || (async () => {});
+    const evalJs0 = ctx?.evalJs0;
+    const evalJsIn = ctx?.evalJsIn;
+    const ctxId = Number(ctx?.ctxId || 0) || 0;
+    const evalJs = (expression) => (typeof evalJsIn === "function" ? evalJsIn(expression, ctxId) : evalJs0?.(expression));
+    const videoPath = String(ctx?.data?.videoPath || "").trim();
+    const abs = videoPath ? ctx?.path?.resolve(videoPath) : "";
+    if (!videoPath) return { ok: false, message: "empty videoPath" };
+    if (!abs || !ctx?.fs?.existsSync?.(abs)) return { ok: false, message: `video not found: ${abs}` };
+
+    const uploadBtnSel =
+      "#joyride-wrapper > main > section > div._dragger-container_1j3uy_39 > div._dragger-content_1j3uy_39 > div._upload-text_1j3uy_68 > button";
+    const fileSelList = [
+      "#joyride-wrapper input[type='file'][accept*='video']",
+      "#joyride-wrapper input[type='file']",
+      "input[type='file'][accept*='video']",
+      "input[type='file']"
+    ];
+    const probeUploadUi = async () => {
+      return (await evalJs?.(
+        `
+(() => {
+  const isVisible = (n) => {
+    try {
+      if (!n) return false;
+      const r = n.getBoundingClientRect ? n.getBoundingClientRect() : null;
+      if (!r) return true;
+      return (r.width || 0) > 8 && (r.height || 0) > 8;
+    } catch { return true; }
+  };
+  const textOf = (n) => String(n?.innerText || n?.textContent || "").replace(/\\s+/g, "");
+  const fileInputs = Array.from(document.querySelectorAll("input[type='file']"));
+  const videoInputs = fileInputs.filter((n) => /video/i.test(String(n.getAttribute("accept") || "")));
+  const btn =
+    document.querySelector(${JSON.stringify(uploadBtnSel)}) ||
+    Array.from(document.querySelectorAll("button,[role=button],div,span")).find((n) => isVisible(n) && textOf(n).includes("上传视频")) ||
+    null;
+  return {
+    ok: true,
+    hasUploadButton: !!btn,
+    hasVideoInput: videoInputs.length > 0,
+    hasAnyInput: fileInputs.length > 0,
+    preferredSelector: videoInputs.length
+      ? "input[type='file'][accept*='video']"
+      : (fileInputs.length ? "input[type='file']" : "")
+  };
+})()
+        `.trim()
+      )) || null;
+    };
+    const buildSelectorQueue = (preferred) => {
+      const list = [];
+      const add = (sel) => {
+        const s = String(sel || "").trim();
+        if (!s || list.includes(s)) return;
+        list.push(s);
+      };
+      add(preferred);
+      fileSelList.forEach(add);
+      return list;
+    };
+
+    throwIfCancelled();
+    step("ks:video:probe_upload_ui");
+    let uiState = await probeUploadUi();
+    let clicked = false;
+
+    if (!uiState?.hasVideoInput && !uiState?.hasAnyInput) {
+      throwIfCancelled();
+      step("ks:video:wait_upload_btn");
+      await waitSelector?.(uploadBtnSel, 2500, ctxId).catch(() => false);
+
+      throwIfCancelled();
+      step("ks:video:click_upload_btn");
+      if (typeof clickSelectorPoint === "function") clicked = !!(await clickSelectorPoint(uploadBtnSel, 40, 16));
+      if (!clicked) {
+        const probe = await evalJs?.(
+          `
+(() => {
+  const textOf = (n) => String(n?.innerText || n?.textContent || "").replace(/\\s+/g, "");
+  const isVisible = (n) => {
+    try {
+      if (!n) return false;
+      const r = n.getBoundingClientRect ? n.getBoundingClientRect() : null;
+      if (!r) return true;
+      return (r.width || 0) > 12 && (r.height || 0) > 12;
+    } catch { return true; }
+  };
+  const btn =
+    document.querySelector(${JSON.stringify(uploadBtnSel)}) ||
+    Array.from(document.querySelectorAll("button,[role=button],div,span")).find((n) => isVisible(n) && textOf(n).includes("上传视频")) ||
+    null;
+  if (!btn) return { ok: false, message: "no upload button" };
+  try { btn.scrollIntoView({ block: "center", inline: "center" }); } catch {}
+  try { btn.click(); } catch {}
+  return { ok: true };
+})()
+          `.trim()
+        );
+        clicked = probe?.ok === true;
+      }
+      await delay(120);
+      const probeStart = Date.now();
+      while (Date.now() - probeStart < 2500) {
+        throwIfCancelled();
+        uiState = await probeUploadUi();
+        if (uiState?.hasVideoInput || uiState?.hasAnyInput) break;
+        await delay(120);
+      }
+    } else {
+      step("ks:video:reuse_existing_input");
+    }
+
+    throwIfCancelled();
+    step("ks:video:set_file");
+    let setRes = null;
+    const selectorQueue = buildSelectorQueue(uiState?.preferredSelector);
+    for (const sel of selectorQueue) {
+      throwIfCancelled();
+      setRes = await trySetFileInputFilesEx?.(abs, "video", sel);
+      if (setRes && setRes.ok === true) break;
+    }
+    if (!setRes || setRes.ok !== true) return { ok: false, message: String(setRes?.message || "set video file failed") };
+
+    throwIfCancelled();
+    step("ks:video:wait_form_ready");
+    const start = Date.now();
+    let ready = null;
+    while (Date.now() - start < 240000) {
+      throwIfCancelled();
+      ready = await evalJs?.(
+        `
+(() => {
+  const text = String(document.body?.innerText || document.body?.textContent || "");
+  const hasEditor = !!document.querySelector("#work-description-edit");
+  const hasCoverEntry = !!document.querySelector("#main-tours div._default-cover_ps02t_86 > div");
+  const failed = /上传失败|上传出错/.test(text);
+  const uploading = /上传中|处理中|转码中|校验中/.test(text);
+  return { ok: !failed && (hasEditor || hasCoverEntry || uploading), hasEditor, hasCoverEntry, failed, uploading };
+})()
+        `.trim()
+      );
+      if (ready?.failed) return { ok: false, message: "video upload failed", result: ready };
+      if (ready?.ok) break;
+      const sec = Math.floor((Date.now() - start) / 5000);
+      if (sec >= 1) step(`ks:video:waiting ${sec * 5}s`);
+      await delay(300);
+    }
+    if (!ready?.ok) return { ok: false, message: "form not ready after upload", result: ready || null };
+    step("ks:video:done");
+    return { ok: true, abs, clickedUpload: clicked, ready };
+  }
+};

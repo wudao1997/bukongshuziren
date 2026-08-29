@@ -1,0 +1,77 @@
+{
+  "name": "bukong-ip-agent",
+  "version": "0.7.3",
+  "private": true,
+  "author": "不空科技",
+  "description": "不空IP智能体桌面端安装包工程。",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder",
+    "postdist": "node gengxinqingdanshengcheng.js",
+    "generate:update-json": "node gengxinqingdanshengcheng.js",
+    "rebuild:native": "electron-builder install-app-deps",
+    "postinstall": "electron-builder install-app-deps"
+  },
+  "build": {
+    "appId": "bukong.vip",
+    "productName": "不空IP智能体",
+    "artifactName": "${productName}-v${version}.${ext}",
+    "compression": "store",
+    "icon": "renderer/assets/bukong-logo.ico",
+    "copyright": "Copyright © 不空科技",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "anzhuangmulu.js",
+      "preload.js",
+      "yijianzidong.js",
+      "yonghushujutongji.js",
+      "zhucexianzhi.js",
+      "gongneng/**",
+      "douyin/**",
+      "kuaishou/**",
+      "shipinhao/**",
+      "xiaohongshu/**",
+      "renderer/**",
+      "package.json",
+      "!kuaishou/kuaishoudenglucookie",
+      "!gongnengxiaoyanrizhi.md",
+      "!tmp-*.mjs"
+    ],
+    "win": {
+      "icon": "renderer/assets/bukong-logo.ico",
+      "executableName": "不空IP智能体",
+      "target": [
+        "nsis"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "include": "build/anzhuangduanzidongshajincheng.nsh",
+      "createDesktopShortcut": "always",
+      "createStartMenuShortcut": true,
+      "installerIcon": "renderer/assets/bukong-logo.ico",
+      "uninstallerIcon": "renderer/assets/bukong-logo.ico",
+      "installerHeaderIcon": "renderer/assets/bukong-logo.ico",
+      "shortcutName": "不空IP智能体",
+      "uninstallDisplayName": "不空IP智能体"
+    }
+  },
+  "devDependencies": {
+    "electron": "^32.3.3",
+    "electron-builder": "^24.6.3"
+  },
+  "dependencies": {
+    "@bsdiff-rust/node": "^0.0.4",
+    "bsdiff-node": "^2.5.0",
+    "electron-updater": "^6.3.9",
+    "ws": "^8.18.3"
+  },
+  "keywords": [],
+  "license": "ISC"
+}

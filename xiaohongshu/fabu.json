@@ -1,0 +1,106 @@
+module.exports = {
+  async run(ctx) {
+    const step = ctx?.step || (() => {});
+    const throwIfCancelled = ctx?.throwIfCancelled || (() => {});
+    const evalJs0 = ctx?.evalJs0;
+    const evalJsIn = ctx?.evalJsIn;
+    const delay = ctx?.delay || (async (ms) => new Promise(resolve => setTimeout(resolve, ms)));
+    const dbg = typeof ctx?.dbg === "function" ? ctx.dbg : () => {};
+    const ctxId = Number(ctx?.ctxIdPublish || 0) || Number(ctx?.ctxId || 0) || 0;
+    const evalJs = (expression) => (typeof evalJsIn === "function" ? evalJsIn(expression, ctxId) : evalJs0?.(expression));
+    const cdp = ctx?.cdp;
+    // 复用框架原生坐标点击方法（核心：自带pierce穿透ShadowDOM）
+    const clickSelectorPoint = ctx?.clickSelectorPoint;
+
+    // 你录制的【原始选择器 + 元素内偏移】（完全还原手动录制）
+    const PUBLISH_SEL = "xhs-publish-btn";
+    const OFFSET_X = 528.5;
+    const OFFSET_Y = 45.5;
+
+    // CDP全局鼠标点击（兜底备用）
+    const dispatchClickAt = async (x, y) => {
+      const xx = Math.max(0, Math.round(x));
+      const yy = Math.max(0, Math.round(y));
+      if (!cdp) return false;
+      try {
+        await cdp.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: xx, y: yy });
+        await delay(400); // 悬浮停留
+        await cdp.send("Input.dispatchMouseEvent", { type: "mousePressed", x: xx, y: yy, button: "left", clickCount: 1 });
+        await delay(200); // 按下停留
+        await cdp.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: xx, y: yy, button: "left", clickCount: 1 });
+        return true;
+      } catch (e) {
+        dbg("H4", "CDP点击异常", e.message);
+        return false;
+      }
+    };
+
+    throwIfCancelled();
+    step("xhs:publish:start 发布按钮（原生选择器+穿透ShadowDOM）");
+
+    // ========== 1. 激活页面焦点 + 滚动页面到底部 ==========
+    // 激活当前标签页焦点，防止后台失焦
+    await cdp.send("Page.bringToFront").catch(() => null);
+    // 滚动页面到底部，露出底部发布栏
+    await cdp.send("Runtime.evaluate", {
+      expression: "window.scrollTo(0, document.documentElement.scrollHeight);"
+    });
+    await delay(800); // 等待滚动+元素渲染
+
+    // ========== 2. 轮询等待按钮元素加载（解决 hasBtn=false） ==========
+    let elemExist = false;
+    let waitTimes = 0;
+    const maxWait = 10; // 最长等待5秒
+    while (waitTimes < maxWait && !elemExist) {
+      elemExist = await evalJs(`
+        (() => {
+          const el = document.querySelector(${JSON.stringify(PUBLISH_SEL)});
+          return !!el;
+        })()
+      `);
+      if (!elemExist) await delay(500);
+      waitTimes++;
+    }
+    if (!elemExist) {
+      return { ok: false, message: "等待超时：未检测到 xhs-publish-btn 按钮" };
+    }
+    dbg("H4", "发布按钮元素已加载");
+
+    // ========== 3. 框架原生方法点击（首选，支持pierce穿透） ==========
+    let clickSuccess = false;
+    // 连续点击3次（间隔停顿，绕过机器人拦截）
+    for (let i = 0; i < 3; i++) {
+      throwIfCancelled();
+      step(`xhs:publish:click_${i+1} 第${i+1}次点击按钮`);
+      const res = await clickSelectorPoint(PUBLISH_SEL, OFFSET_X, OFFSET_Y);
+      if (res) clickSuccess = true;
+      await delay(600); // 每次点击间隔600ms
+    }
+
+    // ========== 4. 原生点击失败 → 兜底全局坐标点击 ==========
+    if (!clickSuccess) {
+      step("xhs:publish:fallback 切换全局坐标兜底点击");
+      const coordList = [
+        { x: 1380, y: 870 },
+        { x: 1400, y: 880 },
+        { x: 1420, y: 860 }
+      ];
+      for (const coord of coordList) {
+        const res = await dispatchClickAt(coord.x, coord.y);
+        if (res) {
+          clickSuccess = true;
+          break;
+        }
+        await delay(400);
+      }
+    }
+
+    if (!clickSuccess) {
+      return { ok: false, message: "多次点击尝试均失败，请检查按钮状态/窗口尺寸" };
+    }
+
+    // 点击后长等待，等待发布弹窗/页面跳转
+    await delay(2000);
+    return { ok: true, tip: "发布动作已触发" };
+  }
+};

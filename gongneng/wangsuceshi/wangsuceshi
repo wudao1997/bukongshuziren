@@ -1,0 +1,114 @@
+// 网速测试功能：用于发布管理 → 网页填表 → 网速测试。输出下载/上传速度（Mbps），并便于主进程记录日志与渲染层显示。
+"use strict";
+
+const https = require("https");
+
+function toMbps(bytes, ms) {
+  const b = Math.max(0, Number(bytes || 0) || 0);
+  const t = Math.max(1, Number(ms || 0) || 1);
+  return (b * 8) / t / 1000;
+}
+
+function round1(n) {
+  const x = Number(n || 0);
+  if (!Number.isFinite(x)) return 0;
+  return Math.round(x * 10) / 10;
+}
+
+function httpsRequestRaw({ method, url, headers, body, timeoutMs }) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (out) => {
+      if (done) return;
+      done = true;
+      resolve(out);
+    };
+    try {
+      const u = new URL(String(url || "").trim());
+      const req = https.request(
+        {
+          protocol: u.protocol,
+          hostname: u.hostname,
+          port: u.port ? Number(u.port) : 443,
+          path: (u.pathname || "/") + (u.search || ""),
+          method: String(method || "GET").toUpperCase(),
+          headers: headers && typeof headers === "object" ? headers : {}
+        },
+        (res) => {
+          let bytes = 0;
+          res.on("data", (d) => {
+            bytes += Buffer.isBuffer(d) ? d.length : Buffer.byteLength(String(d));
+          });
+          res.on("end", () => finish({ ok: true, statusCode: Number(res.statusCode || 0) || 0, bytes }));
+        }
+      );
+      req.on("error", () => finish({ ok: false, statusCode: 0, bytes: 0 }));
+      req.setTimeout(Math.max(300, Number(timeoutMs || 0) || 15000), () => {
+        try {
+          req.destroy();
+        } catch {}
+        finish({ ok: false, statusCode: 0, bytes: 0, timeout: true });
+      });
+      if (body && body.length) req.write(body);
+      req.end();
+    } catch {
+      finish({ ok: false, statusCode: 0, bytes: 0 });
+    }
+  });
+}
+
+async function testNetSpeed(opts) {
+  const step = typeof opts?.step === "function" ? opts.step : () => {};
+  const timeoutMs = Math.max(3000, Number(opts?.timeoutMs || 0) || 15000);
+
+  const downBytes = Math.max(2_000_000, Number(opts?.downBytes || 0) || 6_000_000);
+  const upBytes = Math.max(1_000_000, Number(opts?.upBytes || 0) || 2_000_000);
+
+  const downUrl = `https://speed.cloudflare.com/__down?bytes=${encodeURIComponent(String(downBytes))}`;
+  const upUrl = "https://speed.cloudflare.com/__up";
+
+  step(`netspeed:download:start bytes=${String(downBytes)}`);
+  const t1 = Date.now();
+  const downRes = await httpsRequestRaw({
+    method: "GET",
+    url: downUrl,
+    headers: { "User-Agent": "ipfactory" },
+    timeoutMs
+  });
+  const downMs = Date.now() - t1;
+  const downMbps = round1(toMbps(downRes?.bytes || 0, downMs));
+  step(`netspeed:download:done ok=${String(downRes?.ok)} status=${String(downRes?.statusCode)} bytes=${String(downRes?.bytes || 0)} ms=${String(downMs)} mbps=${String(downMbps)}`);
+
+  step(`netspeed:upload:start bytes=${String(upBytes)}`);
+  const body = Buffer.alloc(upBytes, 0x61);
+  const t2 = Date.now();
+  const upRes = await httpsRequestRaw({
+    method: "POST",
+    url: upUrl,
+    headers: {
+      "User-Agent": "ipfactory",
+      "Content-Type": "application/octet-stream",
+      "Content-Length": String(body.length)
+    },
+    body,
+    timeoutMs
+  });
+  const upMs = Date.now() - t2;
+  const upMbps = round1(toMbps(body.length, upMs));
+  step(`netspeed:upload:done ok=${String(upRes?.ok)} status=${String(upRes?.statusCode)} bytes=${String(body.length)} ms=${String(upMs)} mbps=${String(upMbps)}`);
+
+  const ok = !!(downRes?.ok && upRes?.ok);
+  return {
+    ok,
+    downloadMbps: downMbps,
+    uploadMbps: upMbps,
+    downBytes: Number(downRes?.bytes || 0) || 0,
+    upBytes: body.length,
+    downMs,
+    upMs
+  };
+}
+
+module.exports = {
+  testNetSpeed
+};

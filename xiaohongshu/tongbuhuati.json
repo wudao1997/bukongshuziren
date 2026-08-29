@@ -1,0 +1,143 @@
+module.exports = {
+  async run(ctx) {
+    const step = ctx?.step || (() => {});
+    const throwIfCancelled = ctx?.throwIfCancelled || (() => {});
+    const evalJs0 = ctx?.evalJs0;
+    const evalJsIn = ctx?.evalJsIn;
+    const waitSelector = ctx?.waitSelector;
+    const desc = String(ctx?.data?.desc || "").trim();
+    const tags = Array.isArray(ctx?.data?.tags) ? ctx.data.tags : [];
+    const includeTags = ctx?.opts?.includeTags !== false;
+    const tagText = includeTags
+      ? tags
+          .map((t) => String(t || "").trim())
+          .filter(Boolean)
+          .slice(0, 20)
+          .map((t) => `#${t} `)
+          .join("")
+      : "";
+    const finalText = `${desc}${desc && tagText ? " " : ""}${tagText}`.trim();
+    if (!finalText) return { ok: false, message: "empty desc/tags" };
+    const ctxId = Number(ctx?.ctxIdTags || 0) || Number(ctx?.ctxId || 0) || 0;
+    const evalJs = (expression) => (typeof evalJsIn === "function" ? evalJsIn(expression, ctxId) : evalJs0?.(expression));
+    throwIfCancelled();
+    step(includeTags ? "xhs:tags:wait_editor" : "xhs:desc:wait_editor");
+    const ok = (await waitSelector?.("#publish-container", 8000, ctxId)) === true;
+    if (!ok) return { ok: false, message: "editor not found" };
+    throwIfCancelled();
+    step(includeTags ? "xhs:tags:fill" : "xhs:desc:fill");
+    const r = await evalJs?.(
+      `
+(() => {
+  const text = ${JSON.stringify(finalText)};
+  const isVisible = (n) => {
+    try {
+      if (!n) return false;
+      const r = n.getBoundingClientRect ? n.getBoundingClientRect() : null;
+      if (!r) return true;
+      return (r.width || 0) > 30 && (r.height || 0) > 18;
+    } catch { return true; }
+  };
+  const pickEditor = () => {
+    const root = document.querySelector("#publish-container") || document.body;
+    const list = [
+      "[data-slate-editor='true'][contenteditable='true']",
+      "div.editor-kit-editor-container [contenteditable='true']",
+      "[contenteditable='true'][role='textbox']",
+      "[contenteditable='true']"
+    ];
+    for (const sel of list) {
+      const el = root.querySelector(sel);
+      if (el && isVisible(el)) return el;
+    }
+    const any = Array.from(root.querySelectorAll("[contenteditable='true']")).find((n) => isVisible(n)) || null;
+    return any;
+  };
+  const el = pickEditor();
+  if (!el) return { ok: false, message: "no editor" };
+  try { el.focus(); } catch {}
+  try {
+    document.execCommand("selectAll", false, null);
+    document.execCommand("insertText", false, text);
+  } catch {}
+  const cur = String(el.innerText || "").trim();
+  if (cur !== text) {
+    try { el.innerText = text; } catch {}
+  }
+  try { el.dispatchEvent(new InputEvent("input", { bubbles: true, data: text, inputType: "insertText" })); } catch {
+    try { el.dispatchEvent(new Event("input", { bubbles: true })); } catch {}
+  }
+  try { el.dispatchEvent(new Event("change", { bubbles: true })); } catch {}
+  const dismissSuggestPanel = () => {
+    const hasTag = /#/.test(text);
+    if (!hasTag) return { attempted: false, reason: "no_tag" };
+    const clickBlankArea = () => {
+      const root = document.querySelector("#publish-container") || document.body;
+      const candidates = [
+        root.querySelector(".publish-page-content-settings"),
+        root.querySelector(".publish-page-content-title"),
+        root.querySelector(".publish-page-content-cover"),
+        root.querySelector(".publish-page-content"),
+        root
+      ].filter(Boolean);
+      for (const node of candidates) {
+        if (!isVisible(node)) continue;
+        const rect = node.getBoundingClientRect ? node.getBoundingClientRect() : null;
+        if (!rect || rect.width < 60 || rect.height < 30) continue;
+        const x = Math.min(rect.left + 24, rect.right - 12);
+        const y = Math.min(rect.top + 16, rect.bottom - 12);
+        const target = document.elementFromPoint(x, y) || node;
+        if (!target) continue;
+        try {
+          ["mousedown", "mouseup", "click"].forEach((type) => {
+            target.dispatchEvent(new MouseEvent(type, {
+              bubbles: true,
+              cancelable: true,
+              clientX: x,
+              clientY: y,
+              view: window
+            }));
+          });
+          return true;
+        } catch {}
+      }
+      return false;
+    };
+    try {
+      const sel = window.getSelection ? window.getSelection() : null;
+      if (sel && el.firstChild) {
+        const range = document.createRange();
+        range.selectNodeContents(el);
+        range.collapse(false);
+        sel.removeAllRanges();
+        sel.addRange(range);
+      }
+    } catch {}
+    let enterSent = false;
+    try {
+      ["keydown", "keypress", "keyup"].forEach((type) => {
+        el.dispatchEvent(new KeyboardEvent(type, {
+          key: "Enter",
+          code: "Enter",
+          keyCode: 13,
+          which: 13,
+          bubbles: true,
+          cancelable: true
+        }));
+      });
+      enterSent = true;
+    } catch {}
+    let blankClicked = false;
+    try { blankClicked = clickBlankArea(); } catch {}
+    try { if (document.activeElement === el && typeof el.blur === "function") el.blur(); } catch {}
+    return { attempted: true, enterSent, blankClicked };
+  };
+  const dismiss = dismissSuggestPanel();
+  return { ok: true, len: String(el.innerText || "").trim().length, dismiss };
+})()
+      `.trim()
+    );
+    if (!r || r.ok !== true) return { ok: false, message: String(r?.message || "fill editor failed") };
+    return { ok: true, len: Number(r?.len || 0) || 0, dismiss: r?.dismiss || null };
+  }
+};

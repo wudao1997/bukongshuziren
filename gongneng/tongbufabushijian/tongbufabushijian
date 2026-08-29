@@ -1,0 +1,303 @@
+// 同步发布时间功能：专用于“发布管理 → 网页填表 → 同步发布时间”，通过 CDP 级真实点击与强校验，确保正确选择“立即发布/定时发布”并设置定时时间。
+"use strict";
+
+function _norm(x) {
+  return String(x == null ? "" : x).replace(/\s+/g, " ").trim();
+}
+
+function _parseScheduleAt(scheduleAt) {
+  const s = _norm(scheduleAt);
+  const m = /^(\d{4}-\d{2}-\d{2})\s+(\d{2}):(\d{2})/.exec(s);
+  if (!m) return null;
+  return { date: m[1], hh: m[2], mm: m[3] };
+}
+
+async function _dispatchClickAt(cdp, x, y) {
+  const xx = Math.max(0, Number(x || 0) || 0);
+  const yy = Math.max(0, Number(y || 0) || 0);
+  await cdp.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: xx, y: yy, button: "left", clickCount: 1 }).catch(() => null);
+  await cdp.send("Input.dispatchMouseEvent", { type: "mousePressed", x: xx, y: yy, button: "left", clickCount: 1 }).catch(() => null);
+  await cdp.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: xx, y: yy, button: "left", clickCount: 1 }).catch(() => null);
+  return true;
+}
+
+async function _evalIn(evalJsIn, expression, ctxId) {
+  try {
+    return await evalJsIn(String(expression || ""), Number(ctxId || 0) || 0);
+  } catch {
+    return null;
+  }
+}
+
+function _pickModeText(mode) {
+  const m = _norm(mode);
+  if (m === "schedule" || m === "1") return { wantText: "定时发布", otherText: "立即发布" };
+  return { wantText: "立即发布", otherText: "定时发布" };
+}
+
+function _buildProbeJs() {
+  return `
+(() => {
+  const norm = (x) => String(x == null ? "" : x).replace(/\\s+/g, " ").trim();
+  const textOf = (n) => norm(n && (n.innerText || n.textContent) || "");
+  const isVisible = (el) => {
+    try {
+      if (!el) return false;
+      const r = el.getBoundingClientRect();
+      if (!r || r.width <= 6 || r.height <= 6) return false;
+      const vh = Math.max(0, Number(window.innerHeight || 0) || 0);
+      const vw = Math.max(0, Number(window.innerWidth || 0) || 0);
+      if (!vh || !vw) return true;
+      const pad = 8;
+      const inY = r.bottom > pad && r.top < vh - pad;
+      const inX = r.right > pad && r.left < vw - pad;
+      return inY && inX;
+    } catch { return true; }
+  };
+  const isSelected = (el) => {
+    try {
+      if (!el) return false;
+      const cls = String(el.className || "");
+      if (cls.includes("checked")) return true;
+      const aria = String(el.getAttribute("aria-checked") || "");
+      if (aria === "true") return true;
+      const inp = el.querySelector("input");
+      if (inp && inp.checked) return true;
+      const red = (n) => {
+        try {
+          const c = String(getComputedStyle(n).color || "");
+          return c.includes("254, 44, 85") || c.includes("255, 44, 85") || c === "rgb(255, 0, 0)";
+        } catch { return false; }
+      };
+      if (red(el)) return true;
+      const kids = Array.from(el.querySelectorAll("*")).slice(0, 80);
+      for (const k of kids) if (red(k)) return true;
+      return false;
+    } catch { return false; }
+  };
+  const findRoot = () => {
+    const hard = document.querySelector(".schedule-part-V615Zn,[class*='schedule-part-']");
+    if (hard) return hard;
+    const nodes = Array.from(document.querySelectorAll("*")).filter((n) => textOf(n).includes("发布时间"));
+    const hit = nodes[0] || null;
+    if (!hit) return document;
+    return hit.closest("section,form,main,div") || document;
+  };
+  const root = findRoot();
+  const findOption = (label) => {
+    const want = norm(label);
+    const pool = Array.from(root.querySelectorAll("label,.semi-radio,[role='radio'],div,span")).filter(isVisible);
+    const exact = pool.find((n) => textOf(n) === want) || null;
+    const inc = exact || pool.find((n) => textOf(n).includes(want)) || null;
+    if (!inc) return null;
+    const btn = inc.closest("label,.semi-radio,[role='radio'],[role='button'],button,div") || inc;
+    const r = btn.getBoundingClientRect();
+    return {
+      text: textOf(btn),
+      x: Math.max(1, Math.floor(r.left + r.width / 2)),
+      y: Math.max(1, Math.floor(r.top + r.height / 2)),
+      selected: isSelected(btn),
+      disabled: !!btn.getAttribute("disabled") || !!btn.closest("[aria-disabled='true']"),
+      hasInput: !!btn.querySelector("input")
+    };
+  };
+  const pickTimeInput = () => {
+    const inputs = Array.from(root.querySelectorAll("input")).filter(isVisible);
+    const hit = inputs.find((i) => /\\d{4}-\\d{2}-\\d{2}\\s+\\d{2}:\\d{2}/.test(String(i.value || ""))) ||
+      inputs.find((i) => String(i.getAttribute("placeholder") || "").includes("日期") || String(i.getAttribute("placeholder") || "").includes("时间")) ||
+      null;
+    if (!hit) return null;
+    const r = hit.getBoundingClientRect();
+    return {
+      x: Math.max(1, Math.floor(r.left + Math.min(30, r.width / 2))),
+      y: Math.max(1, Math.floor(r.top + r.height / 2)),
+      value: String(hit.value || ""),
+      ph: String(hit.getAttribute("placeholder") || ""),
+      format: String(hit.getAttribute("format") || "")
+    };
+  };
+  return {
+    href: String(location.href || ""),
+    now: findOption("立即发布"),
+    schedule: findOption("定时发布"),
+    timeInput: pickTimeInput()
+  };
+})()
+  `.trim();
+}
+
+function _buildScrollToScheduleJs() {
+  return `
+(() => {
+  const norm = (x) => String(x == null ? "" : x).replace(/\\s+/g, " ").trim();
+  const textOf = (n) => norm(n && (n.innerText || n.textContent) || "");
+  const findTextNode = (want) => {
+    const w = norm(want);
+    if (!w) return null;
+    const pool = Array.from(document.querySelectorAll("div,section,main,form,span,label")).slice(0, 1500);
+    for (const n of pool) {
+      const t = textOf(n);
+      if (t === w || t.includes(w)) return n;
+    }
+    return null;
+  };
+  const hard = document.querySelector(".schedule-part-V615Zn,[class*='schedule-part-']");
+  const marker = hard || findTextNode("发布时间") || findTextNode("发布设置") || null;
+  const root = hard || (marker ? (marker.closest("section,form,main,div") || marker) : null);
+  try {
+    if (root && root.scrollIntoView) root.scrollIntoView({ block: "center", inline: "nearest" });
+    else window.scrollBy(0, 720);
+  } catch {
+    try { window.scrollBy(0, 720); } catch {}
+  }
+  return { ok: true, hasHard: !!document.querySelector(".schedule-part-V615Zn,[class*='schedule-part-']") };
+})()
+  `.trim();
+}
+
+function _buildSetTimeJs(value) {
+  const v = String(value || "");
+  return `
+(() => {
+  const want = ${JSON.stringify(v)};
+  const norm = (x) => String(x == null ? "" : x).replace(/\\s+/g, " ").trim();
+  const isVisible = (el) => {
+    try {
+      if (!el) return false;
+      const r = el.getBoundingClientRect();
+      return r && r.width > 6 && r.height > 6;
+    } catch { return true; }
+  };
+  const root = document.querySelector(".schedule-part-V615Zn,[class*='schedule-part-']") || document;
+  const inputs = Array.from(root.querySelectorAll("input")).filter(isVisible);
+  const pick = inputs.find((i) => /\\d{4}-\\d{2}-\\d{2}\\s+\\d{2}:\\d{2}/.test(String(i.value || ""))) ||
+    inputs.find((i) => String(i.getAttribute("placeholder") || "").includes("日期") || String(i.getAttribute("placeholder") || "").includes("时间")) ||
+    null;
+  if (!pick) return { ok: false, reason: "no_time_input" };
+  try { pick.focus(); } catch {}
+  try {
+    const proto = Object.getPrototypeOf(pick);
+    const desc = proto ? Object.getOwnPropertyDescriptor(proto, "value") : null;
+    if (desc && typeof desc.set === "function") desc.set.call(pick, want);
+    else pick.value = want;
+    pick.dispatchEvent(new Event("input", { bubbles: true }));
+    pick.dispatchEvent(new Event("change", { bubbles: true }));
+  } catch (e) {
+    return { ok: false, reason: "set_value_failed", error: String(e?.message || e) };
+  }
+  try { pick.blur(); } catch {}
+  return { ok: true, value: String(pick.value || ""), ph: String(pick.getAttribute("placeholder") || "") };
+})()
+  `.trim();
+}
+
+async function syncDouyinPublishTime(opts) {
+  const cdp = opts?.cdp;
+  const evalJsIn = opts?.evalJsIn;
+  const delay = typeof opts?.delay === "function" ? opts.delay : (ms) => new Promise((r) => setTimeout(r, ms));
+  const step = typeof opts?.step === "function" ? opts.step : () => {};
+  const data = opts?.data && typeof opts.data === "object" ? opts.data : {};
+  const ctxId = Number(opts?.ctxId || 0) || 0;
+  if (!cdp || typeof cdp.send !== "function") return { ok: false, scheduleOk: false, reason: "missing_cdp" };
+  if (!evalJsIn || typeof evalJsIn !== "function") return { ok: false, scheduleOk: false, reason: "missing_evalJsIn" };
+
+  const mode = _norm(data?.publishTimeMode);
+  const want = _pickModeText(mode);
+  const scheduleAt = _norm(data?.scheduleAt);
+  const p = mode === "schedule" ? _parseScheduleAt(scheduleAt) : null;
+  const timeValue = p ? `${p.date} ${p.hh}:${p.mm}` : "";
+
+  const probeJs = _buildProbeJs();
+  step(`schedule2:start mode=${mode || "-"} ctxId=${String(ctxId)}`);
+
+  const ensureInView = async () => {
+    for (let i = 1; i <= 10; i += 1) {
+      const st = await _evalIn(evalJsIn, probeJs, ctxId);
+      const hasNow = !!(st && st.now && st.now.x && st.now.y);
+      const hasSch = !!(st && st.schedule && st.schedule.x && st.schedule.y);
+      if (hasNow || hasSch) {
+        step(`schedule2:inview ok=true try=${i} hasNow=${String(hasNow)} hasSchedule=${String(hasSch)}`);
+        return st || null;
+      }
+      const sc = await _evalIn(evalJsIn, _buildScrollToScheduleJs(), ctxId);
+      step(`schedule2:scroll try=${i} ok=${String(sc?.ok)} hasHard=${String(sc?.hasHard)}`);
+      await delay(320);
+    }
+    const st = await _evalIn(evalJsIn, probeJs, ctxId);
+    step(`schedule2:inview ok=false hasNow=${String(!!(st && st.now))} hasSchedule=${String(!!(st && st.schedule))}`);
+    return st || null;
+  };
+
+  const clickTarget = async (which) => {
+    await ensureInView();
+    const st = await _evalIn(evalJsIn, probeJs, ctxId);
+    const now = st?.now || null;
+    const sch = st?.schedule || null;
+    const target = which === "schedule" ? sch : now;
+    if (!target || !target.x || !target.y) return { ok: false, reason: "no_target", state: st || null };
+    if (target.disabled) return { ok: false, reason: "target_disabled", state: st || null };
+    await _dispatchClickAt(cdp, target.x, target.y);
+    await delay(260);
+    const st2 = await _evalIn(evalJsIn, probeJs, ctxId);
+    const now2 = st2?.now || null;
+    const sch2 = st2?.schedule || null;
+    const ok = which === "schedule" ? !!sch2?.selected : !!now2?.selected;
+    return { ok, state: st2 || st || null };
+  };
+
+  const ensureSelected = async () => {
+    const which = want.wantText === "定时发布" ? "schedule" : "now";
+    for (let i = 1; i <= 4; i += 1) {
+      const r = await clickTarget(which);
+      step(`schedule2:click:${which}:try=${i} ok=${String(r.ok)}`);
+      if (r.ok) return { ok: true, state: r.state };
+      await delay(220);
+    }
+    const st = await _evalIn(evalJsIn, probeJs, ctxId);
+    return { ok: false, state: st || null };
+  };
+
+  const pickSelectedText = (st) => {
+    try {
+      const nowSel = !!st?.now?.selected;
+      const schSel = !!st?.schedule?.selected;
+      if (schSel) return "定时发布";
+      if (nowSel) return "立即发布";
+      return "";
+    } catch {
+      return "";
+    }
+  };
+
+  const selRes = await ensureSelected();
+  const selText = pickSelectedText(selRes.state);
+  step(`schedule2:selected=${selText || "-"} want=${want.wantText}`);
+  if (!selRes.ok) return { ok: false, scheduleOk: false, reason: "select_failed", state: selRes.state || null };
+
+  if (mode !== "schedule") {
+    return { ok: true, scheduleOk: true, mode: "now", state: selRes.state || null };
+  }
+  if (!timeValue) {
+    return { ok: false, scheduleOk: false, reason: "invalid_scheduleAt", scheduleAt };
+  }
+
+  const st3 = await _evalIn(evalJsIn, probeJs, ctxId);
+  const ti = st3?.timeInput || null;
+  if (ti && ti.x && ti.y) {
+    await _dispatchClickAt(cdp, ti.x, ti.y);
+    await delay(160);
+  }
+  const setRes = await _evalIn(evalJsIn, _buildSetTimeJs(timeValue), ctxId);
+  step(`schedule2:setTime ok=${String(setRes?.ok)} value=${String(setRes?.value || "")}`);
+  if (setRes?.ok !== true) return { ok: false, scheduleOk: false, reason: "set_time_failed", setRes: setRes || null };
+
+  const st4 = await _evalIn(evalJsIn, probeJs, ctxId);
+  const selText2 = pickSelectedText(st4);
+  const finalOk = selText2 === "定时发布";
+  step(`schedule2:final selected=${selText2 || "-"} ok=${String(finalOk)} time=${String(st4?.timeInput?.value || "")}`);
+  return { ok: finalOk, scheduleOk: finalOk, mode: "schedule", timeValue, state: st4 || null };
+}
+
+module.exports = {
+  syncDouyinPublishTime
+};

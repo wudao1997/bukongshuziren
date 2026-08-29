@@ -1,0 +1,205 @@
+// 快手发布页：同步发布时间 最终版
+// 完全对齐最新录制流程，弹窗确定保存，解决时间重置回退问题
+module.exports = {
+  async run(ctx) {
+    const step = ctx?.step || (() => {});
+    const throwIfCancelled = ctx?.throwIfCancelled || (() => {});
+    const waitSelector = ctx?.waitSelector;
+    const clickSelectorPoint = ctx?.clickSelectorPoint;
+    const evalJs0 = ctx?.evalJs0;
+    const evalJsIn = ctx?.evalJsIn;
+    const delay = ctx?.delay || (async (ms) => new Promise(resolve => setTimeout(resolve, ms)));
+    const mode = String(ctx?.data?.publishTimeMode || "").trim();
+    const scheduleAtRaw = String(ctx?.data?.scheduleAt || "").trim();
+    const ctxId = Number(ctx?.ctxId || 0) || 0;
+    const evalJs = (expression) => (typeof evalJsIn === "function" ? evalJsIn(expression, ctxId) : evalJs0?.(expression));
+
+    // 时间格式统一处理：自动补全 秒
+    const scheduleAt = (() => {
+      if (!scheduleAtRaw) return "";
+      if (/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}$/.test(scheduleAtRaw)) return scheduleAtRaw;
+      if (/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}$/.test(scheduleAtRaw)) return `${scheduleAtRaw}:00`;
+      return scheduleAtRaw;
+    })();
+
+    // ===================== 通用工具函数 =====================
+    /** 自动滚动元素到可视区域（解决页面未下滑、元素看不见） */
+    const scrollToView = async (selector) => {
+      await evalJs(`
+        (() => {
+          const el = document.querySelector(${JSON.stringify(selector)});
+          if(el && el.scrollIntoView){
+            el.scrollIntoView({ behavior: 'instant', block: 'center' });
+          }
+        })();
+      `);
+      await delay(400);
+    };
+
+    /** 文本兜底点击（选择器失效时备用） */
+    const clickByText = async (keyword) => {
+      const r = await evalJs(`
+        (() => {
+          const key = ${JSON.stringify(keyword)};
+          const textOf = (n) => String(n?.innerText || n?.textContent || "").replace(/\\s+/g, "");
+          const isVisible = (n) => {
+            try {
+              const r = n.getBoundingClientRect();
+              return (r.width || 0) > 8 && (r.height || 0) > 8;
+            } catch { return true; }
+          };
+          const nodes = Array.from(document.querySelectorAll("label,button,div,span")).filter(isVisible);
+          const hit = nodes.find(n => textOf(n).includes(key)) || null;
+          if (!hit) return { ok: false };
+          hit.scrollIntoView({ block: "center" });
+          hit.click();
+          return { ok: true };
+        })()
+      `);
+      return r?.ok === true;
+    };
+
+    // ===================== 选择器 + 偏移坐标（全部取自本次录制文件） =====================
+    // 1. 编辑主区域
+    const editAreaSel = "div._edit-section_ql0z6_20";
+    const EDIT_X = 673, EDIT_Y = 496;
+    // 2. 定时发布 原生单选框
+    const scheduleRadioSel = "div._edit-form-item_171ix_7 label:nth-of-type(2) input";
+    const SCHED_RADIO_X = 13, SCHED_RADIO_Y = 1.203125;
+    // 3. 时间输入框
+    const timeInputSel = "div._picker_171ix_411 input";
+    const TIME_INPUT_X = 67, TIME_INPUT_Y = 9;
+    // 4. 日期弹窗根节点 + 弹窗确定按钮
+    const datePopupRoot = "#microSupport";
+    const popupConfirmSel = "#microSupport ul span";
+    const CONFIRM_X = 14, CONFIRM_Y = 4;
+    // 5. 立即发布单选框（兼容切换回立即发布）
+    const nowRadioSel = "div._edit-form-item_171ix_7 label.ant-radio-wrapper-checked input";
+    const NOW_RADIO_X = 46, NOW_RADIO_Y = 2.203125;
+
+    // ===================== 分支1：切换为 立即发布 =====================
+    if (mode !== "schedule") {
+      throwIfCancelled();
+      step("ks:schedule:switch_to_immediate 切换为立即发布");
+
+      await waitSelector(nowRadioSel, 12000, ctxId);
+      await scrollToView(nowRadioSel);
+
+      let clickRadio = false;
+      if (clickSelectorPoint) clickRadio = !!(await clickSelectorPoint(nowRadioSel, NOW_RADIO_X, NOW_RADIO_Y));
+      if (!clickRadio) clickRadio = await clickByText("立即发布");
+      if (!clickRadio) return { ok: false, message: "点击【立即发布】单选框失败" };
+
+      await delay(400);
+      return { ok: true, mode: "now", immediate: true };
+    }
+
+    // ===================== 分支2：切换定时发布 + 设置时间（严格复刻录制7步） =====================
+    if (!scheduleAt) return { ok: false, message: "empty scheduleAt" };
+
+    throwIfCancelled();
+    step("ks:schedule:click_edit_area 点击编辑主区域");
+    // 步骤1：点击编辑区域
+    await waitSelector(editAreaSel, 12000, ctxId);
+    await scrollToView(editAreaSel);
+    let clickEditArea = !!(await clickSelectorPoint(editAreaSel, EDIT_X, EDIT_Y));
+    if (!clickEditArea) clickEditArea = await clickByText("");
+    if (!clickEditArea) return { ok: false, message: "点击编辑区域失败" };
+    await delay(500);
+
+    throwIfCancelled();
+    step("ks:schedule:switch_schedule_mode 切换为定时发布");
+    // 步骤2：点击定时发布单选框
+    await waitSelector(scheduleRadioSel, 12000, ctxId);
+    await scrollToView(scheduleRadioSel);
+    let clickScheduleRadio = !!(await clickSelectorPoint(scheduleRadioSel, SCHED_RADIO_X, SCHED_RADIO_Y));
+    if (!clickScheduleRadio) clickScheduleRadio = await clickByText("定时发布");
+    if (!clickScheduleRadio) return { ok: false, message: "点击【定时发布】单选框失败" };
+    await delay(600);
+
+    throwIfCancelled();
+    step("ks:schedule:open_time_input 点击时间输入框（唤起弹窗）");
+    // 步骤3：点击时间输入框，弹出日期选择弹窗
+    await waitSelector(timeInputSel, 12000, ctxId);
+    await scrollToView(timeInputSel);
+    let clickTimeInput = !!(await clickSelectorPoint(timeInputSel, TIME_INPUT_X, TIME_INPUT_Y));
+    if (!clickTimeInput) clickTimeInput = await clickByText("选择日期时间");
+    if (!clickTimeInput) return { ok: false, message: "点击时间输入框失败" };
+    await delay(600);
+
+    throwIfCancelled();
+    step("ks:schedule:set_time_value 写入目标时间");
+    // 步骤4：修改时间输入框值（适配受控组件）
+    const setTimeRes = await evalJs(`
+      (() => {
+        const targetVal = ${JSON.stringify(scheduleAt)};
+        const input = document.querySelector(${JSON.stringify(timeInputSel)});
+        if (!input) return { ok: false, msg: "未找到时间输入框" };
+
+        input.focus();
+        // 原型链赋值，绕过前端组件劫持
+        const desc = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value");
+        if (desc?.set) desc.set.call(input, targetVal);
+        else input.value = targetVal;
+        input.setAttribute("value", targetVal);
+
+        // 触发页面监听的标准事件
+        input.dispatchEvent(new Event("input", { bubbles: true, cancelable: true }));
+        input.dispatchEvent(new Event("change", { bubbles: true, cancelable: true }));
+
+        return { ok: true, currentVal: input.value };
+      })()
+    `);
+    if (!setTimeRes || !setTimeRes.ok) {
+      return { ok: false, message: `时间赋值失败: ${setTimeRes?.msg || "未知错误"}` };
+    }
+    await delay(400);
+
+    throwIfCancelled();
+    step("ks:schedule:wait_date_popup 等待日期弹窗加载完成");
+    // 步骤5：等待动态弹窗 #microSupport 出现
+    const popupReady = (await waitSelector(datePopupRoot, 12000, ctxId)) === true;
+    if (!popupReady) return { ok: false, message: "日期选择弹窗未弹出" };
+    await scrollToView(popupConfirmSel);
+    await delay(400);
+
+    throwIfCancelled();
+    step("ks:schedule:confirm_in_popup 点击弹窗【确定】按钮（核心保存）");
+    // 步骤6：点击弹窗内【确定】按钮（真正保存时间）
+    let clickConfirm = !!(await clickSelectorPoint(popupConfirmSel, CONFIRM_X, CONFIRM_Y));
+    if (!clickConfirm) clickConfirm = await clickByText("确定");
+    if (!clickConfirm) return { ok: false, message: "点击弹窗【确定】按钮失败" };
+    await delay(500);
+
+    throwIfCancelled();
+    step("ks:schedule:check_popup_closed 检测弹窗是否关闭");
+    // 步骤7：轮询检测弹窗关闭，确认流程完成
+    let popupClosed = false;
+    for (let i = 0; i < 50; i++) {
+      throwIfCancelled();
+      const res = await evalJs(`
+        (() => {
+          const popup = document.querySelector(${JSON.stringify(datePopupRoot)});
+          if (!popup) return { closed: true };
+          const rect = popup.getBoundingClientRect();
+          return { closed: rect.width <= 0 || rect.height <= 0 };
+        })()
+      `);
+      if (res?.closed) {
+        popupClosed = true;
+        break;
+      }
+      await delay(250);
+    }
+    if (!popupClosed) return { ok: false, message: "日期弹窗长时间未关闭，保存失败" };
+
+    // 全部流程执行完毕
+    return {
+      ok: true,
+      mode: "schedule",
+      scheduleAt,
+      popupClosed: true,
+      finalValue: setTimeRes.currentVal
+    };
+  }
+};

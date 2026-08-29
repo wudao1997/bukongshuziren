@@ -1,0 +1,52 @@
+module.exports = {
+  async run(ctx) {
+    const step = ctx?.step || (() => {});
+    const throwIfCancelled = ctx?.throwIfCancelled || (() => {});
+    const waitSelector = ctx?.waitSelector;
+    const clickSelectorPoint = ctx?.clickSelectorPoint;
+    const evalJs0 = ctx?.evalJs0;
+    const evalJsIn = ctx?.evalJsIn;
+    const delay = ctx?.delay || (async () => {});
+    const ctxId = Number(ctx?.ctxId || 0) || 0;
+    const evalJs = (expression) => (typeof evalJsIn === "function" ? evalJsIn(expression, ctxId) : evalJs0?.(expression));
+    const publishSel =
+      "#joyride-wrapper > main > div._edit-container_ql0z6_7 > div._edit-section_ql0z6_20._last_ql0z6_26 > div._edit-section-form_ql0z6_100 > div._edit-section-btns_ql0z6_118 > div._button_3a3lq_1._button-primary_3a3lq_60";
+
+    throwIfCancelled();
+    step("ks:publish:wait_btn");
+    await waitSelector?.(publishSel, 20000, ctxId).catch(() => false);
+
+    throwIfCancelled();
+    step("ks:publish:click_btn");
+    let clicked = false;
+    if (typeof clickSelectorPoint === "function") clicked = !!(await clickSelectorPoint(publishSel, 48, 18));
+    if (!clicked) {
+      const r = await evalJs?.(
+        `
+(() => {
+  const isVisible = (n) => {
+    try {
+      if (!n) return false;
+      const r = n.getBoundingClientRect ? n.getBoundingClientRect() : null;
+      if (!r) return true;
+      return (r.width || 0) > 8 && (r.height || 0) > 8;
+    } catch { return true; }
+  };
+  const textOf = (n) => String(n?.innerText || n?.textContent || "").replace(/\\s+/g, "");
+  const nodes = Array.from(document.querySelectorAll("button,[role=button],div,span")).filter(isVisible);
+  const hit = nodes.find((n) => textOf(n) === "发布" || textOf(n).includes("发布")) || null;
+  if (!hit) return { ok: false, message: "no publish button" };
+  const btn = hit.closest("button,[role=button],div,span") || hit;
+  try { btn.scrollIntoView({ block: "center", inline: "center" }); } catch {}
+  try { btn.click(); } catch {}
+  return { ok: true };
+})()
+        `.trim()
+      );
+      clicked = r?.ok === true;
+    }
+    if (!clicked) return { ok: false, message: "publish click failed" };
+    await delay(1200);
+    return { ok: true, clicked: true };
+  }
+};

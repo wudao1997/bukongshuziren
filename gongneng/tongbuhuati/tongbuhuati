@@ -1,0 +1,282 @@
+// 同步话题功能：专用于“发布管理 → 网页填表 → 同步话题”，通过 CDP 级真实输入，避免 Slate 编辑器状态错乱与重复简介问题。
+"use strict";
+
+function _norm(x) {
+  return String(x == null ? "" : x).replace(/\s+/g, " ").trim();
+}
+
+function _stripHashPrefix(tag) {
+  let t = _norm(tag);
+  if (!t) return "";
+  while (t.startsWith("#") || t.startsWith("＃")) t = t.slice(1);
+  return _norm(t);
+}
+
+function _toTagArray(tags) {
+  if (Array.isArray(tags)) return tags.map(_stripHashPrefix).filter(Boolean).slice(0, 5);
+  return String(tags || "")
+    .replace(/[，\n\r]/g, ",")
+    .split(",")
+    .map(_stripHashPrefix)
+    .filter(Boolean)
+    .slice(0, 5);
+}
+
+async function _dispatchClickAt(cdp, x, y) {
+  const xx = Math.max(0, Number(x || 0) || 0);
+  const yy = Math.max(0, Number(y || 0) || 0);
+  await cdp.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: xx, y: yy, button: "left", clickCount: 1 }).catch(() => null);
+  await cdp.send("Input.dispatchMouseEvent", { type: "mousePressed", x: xx, y: yy, button: "left", clickCount: 1 }).catch(() => null);
+  await cdp.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: xx, y: yy, button: "left", clickCount: 1 }).catch(() => null);
+  return true;
+}
+
+async function _pressBackspace(cdp) {
+  await cdp
+    .send("Input.dispatchKeyEvent", {
+      type: "keyDown",
+      key: "Backspace",
+      code: "Backspace",
+      windowsVirtualKeyCode: 8,
+      nativeVirtualKeyCode: 8
+    })
+    .catch(() => null);
+  await cdp
+    .send("Input.dispatchKeyEvent", {
+      type: "keyUp",
+      key: "Backspace",
+      code: "Backspace",
+      windowsVirtualKeyCode: 8,
+      nativeVirtualKeyCode: 8
+    })
+    .catch(() => null);
+  return true;
+}
+
+async function _typeChar(cdp, ch) {
+  const t = String(ch == null ? "" : ch);
+  if (!t) return true;
+  await cdp.send("Input.dispatchKeyEvent", { type: "char", text: t }).catch(() => null);
+  return true;
+}
+
+async function _evalIn(evalJsIn, expression, ctxId) {
+  try {
+    return await evalJsIn(String(expression || ""), Number(ctxId || 0) || 0);
+  } catch {
+    return null;
+  }
+}
+
+function _buildProbeJs() {
+  return `
+(() => {
+  const norm = (x) => String(x == null ? "" : x).replace(/\\s+/g, " ").trim();
+  const stripInv = (s) => String(s || "").replace(/[\\u200B\\u200C\\u200D\\uFEFF]/g, "");
+  const isVisible = (el) => {
+    try {
+      if (!el) return false;
+      const r = el.getBoundingClientRect();
+      return r && r.width > 6 && r.height > 6;
+    } catch { return true; }
+  };
+  const textOf = (n) => norm(n && (n.innerText || n.textContent) || "");
+  const pickEditor = () => {
+    const hard = document.querySelector("[data-slate-editor='true'][contenteditable='true']") ||
+      document.querySelector("div.editor-kit-editor-container.old [contenteditable='true']") ||
+      document.querySelector("div.editor-kit-editor-container [contenteditable='true']") ||
+      document.querySelector("[contenteditable='true'][role='textbox']");
+    if (hard && isVisible(hard)) return hard;
+    const hints = Array.from(document.querySelectorAll("*"))
+      .filter((n) => textOf(n).includes("添加作品简介") || textOf(n).includes("作品描述") || textOf(n).includes("作品简介"))
+      .slice(0, 5);
+    for (const h of hints) {
+      const root = h.closest("section,form,main,div") || document;
+      const ed = root.querySelector("[data-slate-editor='true'][contenteditable='true']") ||
+        root.querySelector("[contenteditable='true'][role='textbox']") ||
+        root.querySelector("[contenteditable='true']") ||
+        null;
+      if (ed && isVisible(ed)) return ed;
+    }
+    return null;
+  };
+  const getSlateText = (ed) => {
+    try {
+      if (!ed) return "";
+      const strings = Array.from(ed.querySelectorAll('[data-string=\"true\"]'))
+        .filter((x) => String(x.getAttribute(\"data-enter\") || \"\") !== \"true\")
+        .map((x) => stripInv(String(x.textContent || \"\")));
+      if (strings.length) return strings.join(\"\\n\");
+    } catch {}
+    try { return stripInv(String(ed.innerText || ed.textContent || \"\")); } catch { return \"\"; }
+  };
+  const moveCaretToEnd = (ed) => {
+    try {
+      if (!ed || !window.getSelection || !document.createRange) return false;
+      const sel = window.getSelection();
+      const range = document.createRange();
+      const walker = document.createTreeWalker(ed, NodeFilter.SHOW_TEXT, null);
+      let last = null;
+      while (walker.nextNode()) {
+        const n = walker.currentNode;
+        if (n && n.nodeType === 3) last = n;
+      }
+      if (last) {
+        range.setStart(last, last.nodeValue ? last.nodeValue.length : 0);
+        range.collapse(true);
+        sel.removeAllRanges();
+        sel.addRange(range);
+        return true;
+      }
+      range.selectNodeContents(ed);
+      range.collapse(false);
+      sel.removeAllRanges();
+      sel.addRange(range);
+      return true;
+    } catch { return false; }
+  };
+  const ed = pickEditor();
+  if (!ed) return { ok: false, reason: "no_editor" };
+  const rect = ed.getBoundingClientRect();
+  const text = getSlateText(ed);
+  const len = stripInv(text).length;
+  moveCaretToEnd(ed);
+  return {
+    ok: true,
+    len,
+    rect: { left: rect.left, top: rect.top, width: rect.width, height: rect.height },
+    click: { x: Math.max(1, Math.floor(rect.left + rect.width - 8)), y: Math.max(1, Math.floor(rect.top + rect.height - 10)) }
+  };
+})()
+  `.trim();
+}
+
+function _buildEnsureCaretJs() {
+  return `
+(() => {
+  try {
+    const pickEditor = () => {
+      return document.querySelector("[data-slate-editor='true'][contenteditable='true']") ||
+        document.querySelector("div.editor-kit-editor-container.old [contenteditable='true']") ||
+        document.querySelector("div.editor-kit-editor-container [contenteditable='true']") ||
+        document.querySelector("[contenteditable='true'][role='textbox']") ||
+        document.querySelector("[contenteditable='true']") ||
+        null;
+    };
+    const ed = pickEditor();
+    if (!ed || !window.getSelection || !document.createRange) return false;
+    const sel = window.getSelection();
+    const range = document.createRange();
+    const walker = document.createTreeWalker(ed, NodeFilter.SHOW_TEXT, null);
+    let last = null;
+    while (walker.nextNode()) {
+      const n = walker.currentNode;
+      if (n && n.nodeType === 3) last = n;
+    }
+    if (last) {
+      range.setStart(last, last.nodeValue ? last.nodeValue.length : 0);
+      range.collapse(true);
+      sel.removeAllRanges();
+      sel.addRange(range);
+      return true;
+    }
+    range.selectNodeContents(ed);
+    range.collapse(false);
+    sel.removeAllRanges();
+    sel.addRange(range);
+    return true;
+  } catch { return false; }
+})()
+  `.trim();
+}
+
+function _buildReadTextJs() {
+  return `
+(() => {
+  const stripInv = (s) => String(s || "").replace(/[\\u200B\\u200C\\u200D\\uFEFF]/g, "");
+  const ed = document.querySelector("[data-slate-editor='true'][contenteditable='true']") ||
+    document.querySelector("div.editor-kit-editor-container.old [contenteditable='true']") ||
+    document.querySelector("div.editor-kit-editor-container [contenteditable='true']") ||
+    document.querySelector("[contenteditable='true'][role='textbox']") ||
+    document.querySelector("[contenteditable='true']") ||
+    null;
+  if (!ed) return { ok: false, text: "" };
+  try {
+    const strings = Array.from(ed.querySelectorAll('[data-string=\"true\"]'))
+      .filter((x) => String(x.getAttribute(\"data-enter\") || \"\") !== \"true\")
+      .map((x) => stripInv(String(x.textContent || \"\")));
+    if (strings.length) return { ok: true, text: strings.join(\"\\n\") };
+  } catch {}
+  try { return { ok: true, text: stripInv(String(ed.innerText || ed.textContent || \"\")) }; } catch { return { ok: false, text: \"\" }; }
+})()
+  `.trim();
+}
+
+async function syncDouyinHuaTi(opts) {
+  const cdp = opts?.cdp;
+  const evalJsIn = opts?.evalJsIn;
+  const delay = typeof opts?.delay === "function" ? opts.delay : (ms) => new Promise((r) => setTimeout(r, ms));
+  const step = typeof opts?.step === "function" ? opts.step : () => {};
+  const data = opts?.data && typeof opts.data === "object" ? opts.data : {};
+  const ctxId = Number(opts?.ctxId || 0) || 0;
+  if (!cdp || typeof cdp.send !== "function") return { ok: false, filledTags: false, reason: "missing_cdp" };
+  if (!evalJsIn || typeof evalJsIn !== "function") return { ok: false, filledTags: false, reason: "missing_evalJsIn" };
+
+  const descCore = _norm(data?.desc);
+  const tags = _toTagArray(data?.tags);
+  const wantDesc = descCore ? `${descCore} ` : "";
+  const tagTextList = tags.map((t) => `＃${t} `);
+  const wantAll = `${wantDesc}${tagTextList.join("")}`;
+
+  step(`tags2:start ctxId=${String(ctxId)} descLen=${String(descCore.length)} tagCount=${String(tags.length)}`);
+
+  const probeJs = _buildProbeJs();
+  const st0 = await _evalIn(evalJsIn, probeJs, ctxId);
+  if (!st0 || st0.ok !== true) return { ok: false, filledTags: false, reason: String(st0?.reason || "no_editor"), state: st0 || null };
+
+  await _dispatchClickAt(cdp, st0.click?.x, st0.click?.y);
+  await delay(120);
+  await _evalIn(evalJsIn, _buildEnsureCaretJs(), ctxId);
+  await delay(80);
+
+  const st1 = await _evalIn(evalJsIn, probeJs, ctxId);
+  const curLen = Math.max(0, Number(st1?.len || 0) || 0);
+  const deleteCount = curLen + 10;
+  step(`tags2:delete currentLen=${String(curLen)} deleteCount=${String(deleteCount)}`);
+
+  for (let i = 1; i <= deleteCount; i += 1) {
+    await _pressBackspace(cdp);
+    if (i % 40 === 0) await delay(12);
+  }
+  await delay(120);
+  await _evalIn(evalJsIn, _buildEnsureCaretJs(), ctxId);
+
+  if (wantDesc) {
+    step(`tags2:typeDesc len=${String(wantDesc.length)}`);
+    for (const ch of Array.from(wantDesc)) {
+      await _typeChar(cdp, ch);
+      await delay(55);
+    }
+  }
+
+  if (tagTextList.length) {
+    step(`tags2:typeTags chars=${String(tagTextList.join("").length)} gap=500ms`);
+    for (const ch of Array.from(tagTextList.join(""))) {
+      await _typeChar(cdp, ch);
+      await delay(500);
+    }
+  }
+
+  await delay(220);
+  const textRes = await _evalIn(evalJsIn, _buildReadTextJs(), ctxId);
+  const finalText = String(textRes?.text || "");
+  const okDesc = !descCore || finalText.includes(descCore);
+  const okTags = tags.length ? tags.every((t) => finalText.includes(`＃${t}`)) : true;
+  const ok = okDesc && okTags;
+  step(`tags2:verify ok=${String(ok)} okDesc=${String(okDesc)} okTags=${String(okTags)}`);
+  return { ok, filledTags: ok, filledDesc: okDesc, wantAll, state: { len: curLen } };
+}
+
+module.exports = {
+  syncDouyinHuaTi
+};
